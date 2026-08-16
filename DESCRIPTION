@@ -1,0 +1,24 @@
+Package: bayescpp
+Title: Fast C++ Implementations of Posterior Draws Summaries
+Version: 0.0.0.9000
+Authors@R:
+    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
+Description: Provides C++/RcppEigen implementations of summary and
+    convergence diagnostics for posterior draws, matching the 'posterior'
+    package but optimised for speed.
+License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
+    license
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+LinkingTo:
+    Rcpp,
+    RcppEigen,
+    RcppParallel
+Imports:
+    Rcpp,
+    RcppParallel,
+    posterior,
+    tibble
+SystemRequirements: C++20, GNU make
+Config/roxygen2/version: 8.1.0
+Config/build/compilation-database: true
