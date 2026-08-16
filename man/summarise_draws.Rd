@@ -5,16 +5,27 @@
 \alias{summarize_draws}
 \title{Fast summaries of posterior draws}
 \usage{
-summarise_draws(x)
+summarise_draws(x, stats = .bayescpp_all_stats)
 
-summarize_draws(x)
+summarize_draws(x, stats = .bayescpp_all_stats)
 }
 \arguments{
 \item{x}{A \code{draws} object, or an object coercible to one via
 \code{\link[posterior:as_draws]{posterior::as_draws()}}.}
+
+\item{stats}{Character vector of statistics to compute, a subset of
+\code{"mean"}, \code{"median"}, \code{"sd"}, \code{"mad"}, \code{"q5"}, \code{"q95"}, \code{"rhat"},
+\code{"ess_bulk"}, \code{"ess_tail"} (the default: all of them, in that order
+regardless of how \code{stats} is ordered). Statistics that share underlying
+work (e.g. \code{"rhat"} and \code{"ess_bulk"} both rank-normalise and split the
+chains) still only do that work once, but requesting fewer statistics
+skips work that only unrequested statistics need — e.g.
+\code{stats = c("mean", "sd")} skips sorting, rank-normalisation, and FFT
+autocovariance entirely.}
 }
 \value{
-A \link[tibble:tibble]{tibble} with one row per variable.
+A \link[tibble:tibble]{tibble} with one row per variable and one
+column per requested statistic.
 }
 \description{
 A C++/RcppEigen implementation of \code{posterior::summarise_draws()} computing

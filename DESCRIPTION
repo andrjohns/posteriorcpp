@@ -22,3 +22,6 @@ Imports:
 SystemRequirements: C++20, GNU make
 Config/roxygen2/version: 8.1.0
 Config/build/compilation-database: true
+Suggests: 
+    testthat (>= 3.0.0)
+Config/testthat/edition: 3

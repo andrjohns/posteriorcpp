@@ -17,6 +17,19 @@ using Eigen::VectorXd;
 
 static constexpr double EPS = std::numeric_limits<double>::epsilon();
 
+// std::min/std::max do not reliably propagate NaN (they return whichever
+// argument compares "not less than" the other under `<`, and NaN
+// comparisons are always false, so the result silently depends on argument
+// order). R's min()/max() always return NA if either input is NA. These
+// match R's semantics.
+static double na_min(double a, double b) {
+  return (std::isnan(a) || std::isnan(b)) ? NA_REAL : std::min(a, b);
+}
+
+static double na_max(double a, double b) {
+  return (std::isnan(a) || std::isnan(b)) ? NA_REAL : std::max(a, b);
+}
+
 static double quantile7(const std::vector<double>& sorted, double p) {
   const int n = sorted.size();
   const double h = (n - 1) * p;
@@ -191,23 +204,51 @@ static double ess_basic(const Ref<const MatrixXd>& x, Workspace& ws) {
   return ess / tau_hat;
 }
 
+// `want` is a length-9 logical vector in the fixed canonical order: mean,
+// median, sd, mad, q5, q95, rhat, ess_bulk, ess_tail. Statistics that share
+// underlying work (e.g. rhat and ess_bulk both need z_scale(split_chains(x)))
+// still only compute that shared work once; statistics that aren't
+// requested skip their computation (and output column) entirely rather than
+// being computed and discarded.
 // [[Rcpp::export]]
-Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws) {
+Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
+                               Rcpp::LogicalVector want) {
   const Rcpp::IntegerVector dim = draws.attr("dim");
   const int niter = dim[0];
   const int nchains = dim[1];
   const int nvars = dim[2];
   const double* const ptr = draws.begin();
 
-  Rcpp::NumericVector mean_out(nvars);
-  Rcpp::NumericVector median_out(nvars);
-  Rcpp::NumericVector sd_out(nvars);
-  Rcpp::NumericVector mad_out(nvars);
-  Rcpp::NumericVector q5_out(nvars);
-  Rcpp::NumericVector q95_out(nvars);
-  Rcpp::NumericVector rhat_out(nvars);
-  Rcpp::NumericVector ess_bulk_out(nvars);
-  Rcpp::NumericVector ess_tail_out(nvars);
+  const bool want_mean = want[0];
+  const bool want_median = want[1];
+  const bool want_sd = want[2];
+  const bool want_mad = want[3];
+  const bool want_q5 = want[4];
+  const bool want_q95 = want[5];
+  const bool want_rhat = want[6];
+  const bool want_ess_bulk = want[7];
+  const bool want_ess_tail = want[8];
+
+  // Sorting the flattened draws is only needed to derive median/q5/q95 (and
+  // mad, and rhat's folded-tail split, and ess_tail's quantile indicators) —
+  // if none of those are requested, skip the sort entirely.
+  const bool need_sort = want_median || want_mad || want_q5 || want_q95 ||
+                         want_rhat || want_ess_tail;
+  const bool need_bulk_pass = want_rhat || want_ess_bulk;
+  const bool need_tail_rhat_pass = want_rhat;
+  const bool need_ess_tail_pass = want_ess_tail;
+
+  Rcpp::NumericVector mean_out, median_out, sd_out, mad_out, q5_out, q95_out,
+      rhat_out, ess_bulk_out, ess_tail_out;
+  if (want_mean) mean_out = Rcpp::NumericVector(nvars);
+  if (want_median) median_out = Rcpp::NumericVector(nvars);
+  if (want_sd) sd_out = Rcpp::NumericVector(nvars);
+  if (want_mad) mad_out = Rcpp::NumericVector(nvars);
+  if (want_q5) q5_out = Rcpp::NumericVector(nvars);
+  if (want_q95) q95_out = Rcpp::NumericVector(nvars);
+  if (want_rhat) rhat_out = Rcpp::NumericVector(nvars);
+  if (want_ess_bulk) ess_bulk_out = Rcpp::NumericVector(nvars);
+  if (want_ess_tail) ess_tail_out = Rcpp::NumericVector(nvars);
 
   const int n = niter * nchains;
   const int half = niter / 2;
@@ -218,88 +259,108 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws) {
       tbb::blocked_range<int>(0, nvars),
       [&](const tbb::blocked_range<int>& range) {
         Workspace ws;
-        ws.split_buf.resize(srows, scols);
-        ws.z_buf.resize(srows, scols);
-        ws.acov_buf.resize(srows, scols);
-        ws.rho_buf.assign(srows, 0.0);
-        ws.acov_means_buf.resize(srows);
-        ws.chain_mean_buf.resize(scols);
-        ws.rank_pairs.resize((std::size_t)srows * scols);
-        ws.rank_vec.resize((std::size_t)srows * scols);
-        std::vector<double> sorted(n), abs_dev(n);
+        if (need_bulk_pass || need_tail_rhat_pass || need_ess_tail_pass) {
+          ws.split_buf.resize(srows, scols);
+          ws.z_buf.resize(srows, scols);
+          ws.acov_buf.resize(srows, scols);
+          ws.rho_buf.assign(srows, 0.0);
+          ws.acov_means_buf.resize(srows);
+          ws.chain_mean_buf.resize(scols);
+          ws.rank_pairs.resize((std::size_t)srows * scols);
+          ws.rank_vec.resize((std::size_t)srows * scols);
+        }
+        std::vector<double> sorted, abs_dev;
+        if (need_sort) sorted.resize(n);
+        if (want_mad) abs_dev.resize(n);
 
         for (int v = range.begin(); v != range.end(); ++v) {
           const Eigen::Map<const MatrixXd> X(ptr + (std::size_t)v * n, niter,
                                              nchains);
 
           if (X.array().isNaN().any()) {
-            mean_out[v] = NA_REAL;
-            median_out[v] = NA_REAL;
-            sd_out[v] = NA_REAL;
-            mad_out[v] = NA_REAL;
-            q5_out[v] = NA_REAL;
-            q95_out[v] = NA_REAL;
-            rhat_out[v] = NA_REAL;
-            ess_bulk_out[v] = NA_REAL;
-            ess_tail_out[v] = NA_REAL;
+            if (want_mean) mean_out[v] = NA_REAL;
+            if (want_median) median_out[v] = NA_REAL;
+            if (want_sd) sd_out[v] = NA_REAL;
+            if (want_mad) mad_out[v] = NA_REAL;
+            if (want_q5) q5_out[v] = NA_REAL;
+            if (want_q95) q95_out[v] = NA_REAL;
+            if (want_rhat) rhat_out[v] = NA_REAL;
+            if (want_ess_bulk) ess_bulk_out[v] = NA_REAL;
+            if (want_ess_tail) ess_tail_out[v] = NA_REAL;
             continue;
           }
 
           const double mean_val = X.mean();
-          const double sd_val =
-              std::sqrt((X.array() - mean_val).square().sum() / (n - 1));
+          if (want_mean) mean_out[v] = mean_val;
+          if (want_sd)
+            sd_out[v] =
+                std::sqrt((X.array() - mean_val).square().sum() / (n - 1));
 
-          std::copy(X.data(), X.data() + n, sorted.begin());
-          std::sort(sorted.begin(), sorted.end());
-          const double median_val = quantile7(sorted, 0.5);
-          const double q5_val = quantile7(sorted, 0.05);
-          const double q95_val = quantile7(sorted, 0.95);
-
-          for (int i = 0; i < n; i++)
-            abs_dev[i] = std::fabs(sorted[i] - median_val);
-          std::sort(abs_dev.begin(), abs_dev.end());
-          const double mad_val = 1.4826 * quantile7(abs_dev, 0.5);
-
-          split_chains_into(X, ws.split_buf);
-          z_scale_into(ws.split_buf, ws, ws.z_buf);
-          const double rhat_bulk = rhat_basic(ws.z_buf, ws);
-          const double ess_bulk_val = ess_basic(ws.z_buf, ws);
-
-          split_chains_into((X.array() - median_val).abs().matrix(),
-                            ws.split_buf);
-          z_scale_into(ws.split_buf, ws, ws.z_buf);
-          const double rhat_tail = rhat_basic(ws.z_buf, ws);
-
-          const bool x_bad =
-              !X.allFinite() || (X.maxCoeff() - X.minCoeff()) < EPS;
-          double ess_q5 = NA_REAL;
-          double ess_q95 = NA_REAL;
-          if (!x_bad) {
-            split_chains_into((X.array() <= q5_val).cast<double>().matrix(),
-                              ws.split_buf);
-            ess_q5 = ess_basic(ws.split_buf, ws);
-
-            split_chains_into((X.array() <= q95_val).cast<double>().matrix(),
-                              ws.split_buf);
-            ess_q95 = ess_basic(ws.split_buf, ws);
+          double median_val = NA_REAL, q5_val = NA_REAL, q95_val = NA_REAL;
+          if (need_sort) {
+            std::copy(X.data(), X.data() + n, sorted.begin());
+            std::sort(sorted.begin(), sorted.end());
+            median_val = quantile7(sorted, 0.5);
+            q5_val = quantile7(sorted, 0.05);
+            q95_val = quantile7(sorted, 0.95);
+            if (want_median) median_out[v] = median_val;
+            if (want_q5) q5_out[v] = q5_val;
+            if (want_q95) q95_out[v] = q95_val;
           }
 
-          mean_out[v] = mean_val;
-          median_out[v] = median_val;
-          sd_out[v] = sd_val;
-          mad_out[v] = mad_val;
-          q5_out[v] = q5_val;
-          q95_out[v] = q95_val;
-          rhat_out[v] = std::max(rhat_bulk, rhat_tail);
-          ess_bulk_out[v] = ess_bulk_val;
-          ess_tail_out[v] = std::min(ess_q5, ess_q95);
+          if (want_mad) {
+            for (int i = 0; i < n; i++)
+              abs_dev[i] = std::fabs(sorted[i] - median_val);
+            std::sort(abs_dev.begin(), abs_dev.end());
+            mad_out[v] = 1.4826 * quantile7(abs_dev, 0.5);
+          }
+
+          double rhat_bulk = NA_REAL, ess_bulk_val = NA_REAL;
+          if (need_bulk_pass) {
+            split_chains_into(X, ws.split_buf);
+            z_scale_into(ws.split_buf, ws, ws.z_buf);
+            if (want_rhat) rhat_bulk = rhat_basic(ws.z_buf, ws);
+            if (want_ess_bulk) ess_bulk_val = ess_basic(ws.z_buf, ws);
+            if (want_ess_bulk) ess_bulk_out[v] = ess_bulk_val;
+          }
+
+          double rhat_tail = NA_REAL;
+          if (need_tail_rhat_pass) {
+            split_chains_into((X.array() - median_val).abs().matrix(),
+                              ws.split_buf);
+            z_scale_into(ws.split_buf, ws, ws.z_buf);
+            rhat_tail = rhat_basic(ws.z_buf, ws);
+          }
+          if (want_rhat) rhat_out[v] = na_max(rhat_bulk, rhat_tail);
+
+          if (need_ess_tail_pass) {
+            const bool x_bad =
+                !X.allFinite() || (X.maxCoeff() - X.minCoeff()) < EPS;
+            double ess_q5 = NA_REAL;
+            double ess_q95 = NA_REAL;
+            if (!x_bad) {
+              split_chains_into((X.array() <= q5_val).cast<double>().matrix(),
+                                ws.split_buf);
+              ess_q5 = ess_basic(ws.split_buf, ws);
+
+              split_chains_into((X.array() <= q95_val).cast<double>().matrix(),
+                                ws.split_buf);
+              ess_q95 = ess_basic(ws.split_buf, ws);
+            }
+            ess_tail_out[v] = na_min(ess_q5, ess_q95);
+          }
         }
       });
 
-  return Rcpp::List::create(
-      Rcpp::Named("mean") = mean_out, Rcpp::Named("median") = median_out,
-      Rcpp::Named("sd") = sd_out, Rcpp::Named("mad") = mad_out,
-      Rcpp::Named("q5") = q5_out, Rcpp::Named("q95") = q95_out,
-      Rcpp::Named("rhat") = rhat_out, Rcpp::Named("ess_bulk") = ess_bulk_out,
-      Rcpp::Named("ess_tail") = ess_tail_out);
+  Rcpp::List out;
+  if (want_mean) out["mean"] = mean_out;
+  if (want_median) out["median"] = median_out;
+  if (want_sd) out["sd"] = sd_out;
+  if (want_mad) out["mad"] = mad_out;
+  if (want_q5) out["q5"] = q5_out;
+  if (want_q95) out["q95"] = q95_out;
+  if (want_rhat) out["rhat"] = rhat_out;
+  if (want_ess_bulk) out["ess_bulk"] = ess_bulk_out;
+  if (want_ess_tail) out["ess_tail"] = ess_tail_out;
+  return out;
 }
