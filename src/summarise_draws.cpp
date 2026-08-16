@@ -11,10 +11,6 @@
 #include <unsupported/Eigen/FFT>
 #include <vector>
 
-using Eigen::MatrixXd;
-using Eigen::Ref;
-using Eigen::VectorXd;
-
 static constexpr double EPS = std::numeric_limits<double>::epsilon();
 
 // std::min/std::max do not reliably propagate NaN (they return whichever
@@ -32,7 +28,7 @@ static double na_max(double a, double b) {
 
 // A matrix is "degenerate" for rhat/ess purposes if it has non-finite
 // entries or every entry is (numerically) identical.
-static bool is_degenerate(const Ref<const MatrixXd>& x) {
+static bool is_degenerate(const Eigen::Ref<const Eigen::MatrixXd>& x) {
   return !x.allFinite() || (x.maxCoeff() - x.minCoeff()) < EPS;
 }
 
@@ -45,19 +41,19 @@ static double quantile7(const std::vector<double>& sorted, double p) {
 }
 
 template <typename Derived>
-static MatrixXd split_chains(const Eigen::MatrixBase<Derived>& x) {
+static Eigen::MatrixXd split_chains(const Eigen::MatrixBase<Derived>& x) {
   const int niter = x.rows();
   const int half = niter / 2;
   if (half == 0) {
     return x;
   }
-  MatrixXd out(half, 2 * x.cols());
+  Eigen::MatrixXd out(half, 2 * x.cols());
   out.leftCols(x.cols()) = x.topRows(half);
   out.rightCols(x.cols()) = x.bottomRows(half);
   return out;
 }
 
-static MatrixXd z_scale(const Ref<const MatrixXd>& x) {
+static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x) {
   const int S = x.size();
   const double* const data = x.data();
   // Sort contiguous (value, index) pairs rather than an index array that
@@ -84,7 +80,7 @@ static MatrixXd z_scale(const Ref<const MatrixXd>& x) {
   }
   constexpr double c = 3.0 / 8.0;
   const double denom = S - 2 * c + 1;
-  MatrixXd z(x.rows(), x.cols());
+  Eigen::MatrixXd z(x.rows(), x.cols());
   for (int k = 0; k < S; k++) {
     z.data()[k] = R::qnorm((rank[k] - c) / denom, 0.0, 1.0, 1, 0);
   }
@@ -114,8 +110,9 @@ static int nextn(int n) {
   }
 }
 
-static void autocovariance(const Ref<const VectorXd>& x,
-                           Eigen::FFT<double>& fft, Eigen::Ref<VectorXd> out) {
+static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
+                           Eigen::FFT<double>& fft,
+                           Eigen::Ref<Eigen::VectorXd> out) {
   const int N = x.size();
   const double xmean = x.mean();
   const double varx = (x.array() - xmean).square().sum() / (N - 1);
@@ -143,13 +140,13 @@ static void autocovariance(const Ref<const VectorXd>& x,
   out *= varx * (N - 1) / N / out[0];
 }
 
-static double rhat_basic(const Ref<const MatrixXd>& x) {
+static double rhat_basic(const Eigen::Ref<const Eigen::MatrixXd>& x) {
   const int niter = x.rows();
   const int nchains = x.cols();
   if (is_degenerate(x)) {
     return NA_REAL;
   }
-  const VectorXd chain_mean = x.colwise().mean();
+  const Eigen::VectorXd chain_mean = x.colwise().mean();
   double var_within = 0.0;
   for (int c = 0; c < nchains; c++) {
     var_within +=
@@ -162,21 +159,22 @@ static double rhat_basic(const Ref<const MatrixXd>& x) {
   return std::sqrt((var_between / var_within + niter - 1) / niter);
 }
 
-static double ess_basic(const Ref<const MatrixXd>& x, Eigen::FFT<double>& fft) {
+static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
+                        Eigen::FFT<double>& fft) {
   const int niter = x.rows();
   const int nchains = x.cols();
   if (niter < 3 || is_degenerate(x)) {
     return NA_REAL;
   }
-  MatrixXd acov(niter, nchains);
+  Eigen::MatrixXd acov(niter, nchains);
   for (int c = 0; c < nchains; c++) {
     autocovariance(x.col(c), fft, acov.col(c));
   }
-  const VectorXd acov_means = acov.rowwise().mean();
+  const Eigen::VectorXd acov_means = acov.rowwise().mean();
   const double mean_var = acov_means[0] * niter / (niter - 1.0);
   double var_plus = acov_means[0];
   if (nchains > 1) {
-    const VectorXd chain_mean = x.colwise().mean();
+    const Eigen::VectorXd chain_mean = x.colwise().mean();
     const double mu = chain_mean.mean();
     var_plus += (chain_mean.array() - mu).square().sum() / (nchains - 1);
   }
@@ -302,7 +300,7 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
         }
 
         for (int v = range.begin(); v != range.end(); ++v) {
-          const Eigen::Map<const MatrixXd> X(
+          const Eigen::Map<const Eigen::MatrixXd> X(
               ptr + static_cast<std::size_t>(v) * n, niter, nchains);
 
           if (X.array().isNaN().any()) {
@@ -346,7 +344,7 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
 
           double rhat_bulk = NA_REAL;
           if (need_bulk_pass) {
-            const MatrixXd Xsz = z_scale(split_chains(X));
+            const Eigen::MatrixXd Xsz = z_scale(split_chains(X));
             if (want_rhat) {
               rhat_bulk = rhat_basic(Xsz);
             }
@@ -357,7 +355,7 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
 
           double rhat_tail = NA_REAL;
           if (want_rhat) {
-            const MatrixXd Xfsz =
+            const Eigen::MatrixXd Xfsz =
                 z_scale(split_chains((X.array() - median_val).abs().matrix()));
             rhat_tail = rhat_basic(Xfsz);
             rhat_out[v] = na_max(rhat_bulk, rhat_tail);
