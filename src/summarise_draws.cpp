@@ -219,12 +219,12 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
   return ess / tau_hat;
 }
 
-// `want` is a length-9 logical vector in the fixed canonical order: mean,
-// median, sd, mad, q5, q95, rhat, ess_bulk, ess_tail. Statistics that share
-// underlying work (e.g. rhat and ess_bulk both need z_scale(split_chains(x)))
-// still only compute that shared work once; statistics that aren't
-// requested skip their computation (and output column) entirely rather than
-// being computed and discarded.
+// `want` is a length-12 logical vector in the fixed canonical order: mean,
+// median, sd, var, mad, q5, q95, rhat, rhat_basic, ess_bulk, ess_tail,
+// ess_basic. Statistics that share underlying work (e.g. rhat and ess_bulk
+// both need z_scale(split_chains(x))) still only compute that shared work
+// once; statistics that aren't requested skip their computation (and output
+// column) entirely rather than being computed and discarded.
 // [[Rcpp::export]]
 Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
                                Rcpp::LogicalVector want) {
@@ -237,25 +237,33 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   const bool want_mean = want[0];
   const bool want_median = want[1];
   const bool want_sd = want[2];
-  const bool want_mad = want[3];
-  const bool want_q5 = want[4];
-  const bool want_q95 = want[5];
-  const bool want_rhat = want[6];
-  const bool want_ess_bulk = want[7];
-  const bool want_ess_tail = want[8];
+  const bool want_var = want[3];
+  const bool want_mad = want[4];
+  const bool want_q5 = want[5];
+  const bool want_q95 = want[6];
+  const bool want_rhat = want[7];
+  const bool want_rhat_basic = want[8];
+  const bool want_ess_bulk = want[9];
+  const bool want_ess_tail = want[10];
+  const bool want_ess_basic = want[11];
 
   // Sorting the flattened draws is only needed to derive median/q5/q95 (and
   // mad, and rhat's folded-tail split, and ess_tail's quantile indicators) —
   // if none of those are requested, skip the sort entirely.
   const bool need_sort = want_median || want_mad || want_q5 || want_q95 ||
                          want_rhat || want_ess_tail;
-  const bool need_bulk_pass = want_rhat || want_ess_bulk;
+  // rhat_basic/ess_basic need split_chains(x) unnormalised; rhat/ess_bulk
+  // need it rank-normalised (z_scale) on top. Both start from the same
+  // split_chains(x), so that's only computed once for either.
+  const bool need_raw_bulk_pass = want_rhat_basic || want_ess_basic;
+  const bool need_norm_bulk_pass = want_rhat || want_ess_bulk;
 
   // Pre-filled with NA so a NaN-containing variable can just `continue`
   // without writing NA to every requested column individually below — every
   // other code path always overwrites its column explicitly.
-  Rcpp::NumericVector mean_out, median_out, sd_out, mad_out, q5_out, q95_out,
-      rhat_out, ess_bulk_out, ess_tail_out;
+  Rcpp::NumericVector mean_out, median_out, sd_out, var_out, mad_out, q5_out,
+      q95_out, rhat_out, rhat_basic_out, ess_bulk_out, ess_tail_out,
+      ess_basic_out;
   if (want_mean) {
     mean_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
@@ -264,6 +272,9 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   }
   if (want_sd) {
     sd_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
+  if (want_var) {
+    var_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
   if (want_mad) {
     mad_out = Rcpp::NumericVector(nvars, NA_REAL);
@@ -277,11 +288,17 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   if (want_rhat) {
     rhat_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
+  if (want_rhat_basic) {
+    rhat_basic_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
   if (want_ess_bulk) {
     ess_bulk_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
   if (want_ess_tail) {
     ess_tail_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
+  if (want_ess_basic) {
+    ess_basic_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
 
   const int n = niter * nchains;
@@ -311,9 +328,15 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           if (want_mean) {
             mean_out[v] = mean_val;
           }
-          if (want_sd) {
-            sd_out[v] =
-                std::sqrt((X.array() - mean_val).square().sum() / (n - 1));
+          if (want_sd || want_var) {
+            const double var_val =
+                (X.array() - mean_val).square().sum() / (n - 1);
+            if (want_sd) {
+              sd_out[v] = std::sqrt(var_val);
+            }
+            if (want_var) {
+              var_out[v] = var_val;
+            }
           }
 
           double median_val = NA_REAL, q5_val = NA_REAL, q95_val = NA_REAL;
@@ -343,13 +366,22 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           }
 
           double rhat_bulk = NA_REAL;
-          if (need_bulk_pass) {
-            const Eigen::MatrixXd Xsz = z_scale(split_chains(X));
-            if (want_rhat) {
-              rhat_bulk = rhat_basic(Xsz);
+          if (need_raw_bulk_pass || need_norm_bulk_pass) {
+            const Eigen::MatrixXd Xs = split_chains(X);
+            if (want_rhat_basic) {
+              rhat_basic_out[v] = rhat_basic(Xs);
             }
-            if (want_ess_bulk) {
-              ess_bulk_out[v] = ess_basic(Xsz, fft);
+            if (want_ess_basic) {
+              ess_basic_out[v] = ess_basic(Xs, fft);
+            }
+            if (need_norm_bulk_pass) {
+              const Eigen::MatrixXd Xsz = z_scale(Xs);
+              if (want_rhat) {
+                rhat_bulk = rhat_basic(Xsz);
+              }
+              if (want_ess_bulk) {
+                ess_bulk_out[v] = ess_basic(Xsz, fft);
+              }
             }
           }
 
@@ -387,6 +419,9 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   if (want_sd) {
     out["sd"] = sd_out;
   }
+  if (want_var) {
+    out["var"] = var_out;
+  }
   if (want_mad) {
     out["mad"] = mad_out;
   }
@@ -399,11 +434,17 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   if (want_rhat) {
     out["rhat"] = rhat_out;
   }
+  if (want_rhat_basic) {
+    out["rhat_basic"] = rhat_basic_out;
+  }
   if (want_ess_bulk) {
     out["ess_bulk"] = ess_bulk_out;
   }
   if (want_ess_tail) {
     out["ess_tail"] = ess_tail_out;
+  }
+  if (want_ess_basic) {
+    out["ess_basic"] = ess_basic_out;
   }
   return out;
 }

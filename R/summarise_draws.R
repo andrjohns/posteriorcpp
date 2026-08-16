@@ -1,27 +1,42 @@
 #' @keywords internal
-.bayescpp_all_stats <- c("mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail")
+.bayescpp_all_stats <- c(
+  "mean", "median", "sd", "var", "mad", "q5", "q95",
+  "rhat", "rhat_basic", "ess_bulk", "ess_tail", "ess_basic"
+)
+
+#' @keywords internal
+.bayescpp_default_stats <- c(
+  "mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail"
+)
 
 #' Fast summaries of posterior draws
 #'
 #' A C++/RcppEigen implementation of `posterior::summarise_draws()` computing
 #' the default summary and convergence measures: mean, median, sd, mad, q5,
-#' q95, rhat, ess_bulk, and ess_tail.
+#' q95, rhat, ess_bulk, and ess_tail. Additional measures matching their
+#' `posterior` equivalents are available opt-in via `stats` (see below).
 #'
 #' @param x A `draws` object, or an object coercible to one via
 #'   [posterior::as_draws()].
-#' @param stats Character vector of statistics to compute, a subset of
+#' @param stats Character vector of statistics to compute. The default is
 #'   `"mean"`, `"median"`, `"sd"`, `"mad"`, `"q5"`, `"q95"`, `"rhat"`,
-#'   `"ess_bulk"`, `"ess_tail"` (the default: all of them, in that order
-#'   regardless of how `stats` is ordered). Statistics that share underlying
-#'   work (e.g. `"rhat"` and `"ess_bulk"` both rank-normalise and split the
-#'   chains) still only do that work once, but requesting fewer statistics
-#'   skips work that only unrequested statistics need — e.g.
-#'   `stats = c("mean", "sd")` skips sorting, rank-normalisation, and FFT
-#'   autocovariance entirely.
+#'   `"ess_bulk"`, `"ess_tail"` — matching `posterior::summarise_draws()`'s
+#'   own default set exactly. Two more are available opt-in:
+#'   `"var"` (variance, i.e. `sd^2`) and the unnormalised diagnostics
+#'   `"rhat_basic"`/`"ess_basic"` (matching `posterior::rhat_basic()`/
+#'   `posterior::ess_basic()` — split-chains without the rank-normalising
+#'   z-score step that `"rhat"`/`"ess_bulk"` apply). Output columns are
+#'   always in the fixed canonical order above regardless of how `stats` is
+#'   ordered. Statistics that share underlying work (e.g. `"rhat"` and
+#'   `"ess_bulk"` both rank-normalise and split the chains; `"rhat_basic"`
+#'   and `"rhat"` both start from the same unnormalised split) still only do
+#'   that work once, but requesting fewer statistics skips work that only
+#'   unrequested statistics need — e.g. `stats = c("mean", "sd")` skips
+#'   sorting, rank-normalisation, and FFT autocovariance entirely.
 #' @return A [tibble][tibble::tibble] with one row per variable and one
 #'   column per requested statistic.
 #' @export
-summarise_draws <- function(x, stats = .bayescpp_all_stats) {
+summarise_draws <- function(x, stats = .bayescpp_default_stats) {
   if (length(stats) == 0L) {
     stop("`stats` must specify at least one statistic to compute.")
   }

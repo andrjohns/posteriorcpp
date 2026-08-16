@@ -5,23 +5,29 @@
 \alias{summarize_draws}
 \title{Fast summaries of posterior draws}
 \usage{
-summarise_draws(x, stats = .bayescpp_all_stats)
+summarise_draws(x, stats = .bayescpp_default_stats)
 
-summarize_draws(x, stats = .bayescpp_all_stats)
+summarize_draws(x, stats = .bayescpp_default_stats)
 }
 \arguments{
 \item{x}{A \code{draws} object, or an object coercible to one via
 \code{\link[posterior:as_draws]{posterior::as_draws()}}.}
 
-\item{stats}{Character vector of statistics to compute, a subset of
+\item{stats}{Character vector of statistics to compute. The default is
 \code{"mean"}, \code{"median"}, \code{"sd"}, \code{"mad"}, \code{"q5"}, \code{"q95"}, \code{"rhat"},
-\code{"ess_bulk"}, \code{"ess_tail"} (the default: all of them, in that order
-regardless of how \code{stats} is ordered). Statistics that share underlying
-work (e.g. \code{"rhat"} and \code{"ess_bulk"} both rank-normalise and split the
-chains) still only do that work once, but requesting fewer statistics
-skips work that only unrequested statistics need — e.g.
-\code{stats = c("mean", "sd")} skips sorting, rank-normalisation, and FFT
-autocovariance entirely.}
+\code{"ess_bulk"}, \code{"ess_tail"} — matching \code{posterior::summarise_draws()}'s
+own default set exactly. Two more are available opt-in:
+\code{"var"} (variance, i.e. \code{sd^2}) and the unnormalised diagnostics
+\code{"rhat_basic"}/\code{"ess_basic"} (matching \code{posterior::rhat_basic()}/
+\code{posterior::ess_basic()} — split-chains without the rank-normalising
+z-score step that \code{"rhat"}/\code{"ess_bulk"} apply). Output columns are
+always in the fixed canonical order above regardless of how \code{stats} is
+ordered. Statistics that share underlying work (e.g. \code{"rhat"} and
+\code{"ess_bulk"} both rank-normalise and split the chains; \code{"rhat_basic"}
+and \code{"rhat"} both start from the same unnormalised split) still only do
+that work once, but requesting fewer statistics skips work that only
+unrequested statistics need — e.g. \code{stats = c("mean", "sd")} skips
+sorting, rank-normalisation, and FFT autocovariance entirely.}
 }
 \value{
 A \link[tibble:tibble]{tibble} with one row per variable and one
@@ -30,5 +36,6 @@ column per requested statistic.
 \description{
 A C++/RcppEigen implementation of \code{posterior::summarise_draws()} computing
 the default summary and convergence measures: mean, median, sd, mad, q5,
-q95, rhat, ess_bulk, and ess_tail.
+q95, rhat, ess_bulk, and ess_tail. Additional measures matching their
+\code{posterior} equivalents are available opt-in via \code{stats} (see below).
 }
