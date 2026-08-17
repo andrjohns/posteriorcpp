@@ -7,15 +7,18 @@
 
 #include <algorithm>
 #include <cmath>
-#include <complex>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
-#include <unsupported/Eigen/FFT>
 #include <vector>
+
+// autocovariance() below calls pocketfft_r::exec() directly, never r2c()/
+// c2r(), so get_plan()'s cache and this thread pool are both unused.
+#define POCKETFFT_NO_MULTITHREADING
+#include "include/pocketfft_hdronly.h"
 
 static constexpr double EPS = std::numeric_limits<double>::epsilon();
 
@@ -88,6 +91,12 @@ static inline int split_chains_size(int niter, int nchains) {
   return (niter / 2 == 0 ? niter : 2 * (niter / 2)) * nchains;
 }
 
+// split_chains(X)'s per-column length -- same "half, else unchanged" rule.
+static inline int post_split_niter(int niter) {
+  const int half = niter / 2;
+  return half == 0 ? niter : half;
+}
+
 struct ZScratch {
   std::vector<std::uint64_t> ka, kb;  // sort keys, ping-pong buffers
   std::vector<int> ia, ib;            // permutation, ping-pong buffers
@@ -114,9 +123,11 @@ static void average_ranks(const double* data, int S, ZScratch& sc) {
     for (int i = 0; i < S; i++) {
       sc.pbuf[i] = {data[i], i};
     }
-    std::sort(sc.pbuf.begin(), sc.pbuf.end(),
-              [](const std::pair<double, int>& a,
-                 const std::pair<double, int>& b) { return a.first < b.first; });
+    std::sort(
+        sc.pbuf.begin(), sc.pbuf.end(),
+        [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+          return a.first < b.first;
+        });
     sc.rank.resize(S);
     int i = 0;
     while (i < S) {
@@ -220,13 +231,13 @@ static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
   for (int k = 0; k < S; k++) {
     const double r = sc.rank[k];
     const int ir = static_cast<int>(r);
-    z.data()[k] = (r == ir) ? lut[ir - 1]
-                            : R::qnorm((r - c) / denom, 0.0, 1.0, 1, 0);
+    z.data()[k] =
+        (r == ir) ? lut[ir - 1] : R::qnorm((r - c) / denom, 0.0, 1.0, 1, 0);
   }
   return z;
 }
 
-// Next 5-smooth multiple of 4 >= n (kissfft real-FFT needs nfft % 4 == 0).
+// Next 5-smooth multiple of 4 >= n; keeps the FFT size composite-friendly.
 static int nextn(int n) {
   for (int cand = n;; cand++) {
     if (cand % 2 != 0) {
@@ -248,16 +259,35 @@ static int nextn(int n) {
   }
 }
 
+using PocketPlan = pocketfft::detail::pocketfft_r<double>;
+
+// L is call-invariant like qnorm_lut's S above -- cache it globally too.
+// exec() is const with external scratch, so sharing across threads is safe.
+static std::mutex g_pocketfft_plan_mutex;
+static std::unordered_map<int, std::shared_ptr<const PocketPlan>>
+    g_pocketfft_plan_cache;
+
+static std::shared_ptr<const PocketPlan> pocketfft_plan(int L) {
+  {
+    std::lock_guard<std::mutex> lock(g_pocketfft_plan_mutex);
+    const auto it = g_pocketfft_plan_cache.find(L);
+    if (it != g_pocketfft_plan_cache.end()) {
+      return it->second;
+    }
+  }
+  auto plan = std::make_shared<const PocketPlan>(static_cast<std::size_t>(L));
+  std::lock_guard<std::mutex> lock(g_pocketfft_plan_mutex);
+  return g_pocketfft_plan_cache.emplace(L, std::move(plan)).first->second;
+}
+
 static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
-                           const double xmean,
-                           Eigen::FFT<double>& fft,
-                           std::vector<double>& re,               // scratch
-                           std::vector<std::complex<double>>& freq,  // scratch
+                           const double xmean, const PocketPlan& plan,
+                           std::vector<double>& re,  // scratch, length 2M
                            Eigen::Ref<Eigen::VectorXd> out) {
   const int N = x.size();
-  const int M = nextn(N);
-  // Zero-padding to 2M turns the circular FFT correlation into a linear one.
-  re.assign(2 * M, 0.0);
+  const int L = static_cast<int>(plan.length());
+  // Zero-padding to L=2M turns the circular FFT correlation into a linear one.
+  re.assign(L, 0.0);
   Eigen::Map<Eigen::VectorXd>(re.data(), N) = x.array() - xmean;
   // Sum of squared centred deviations (= sample variance * (N - 1)).
   const double ss =
@@ -266,17 +296,23 @@ static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
     out.setZero();
     return;
   }
-  fft.fwd(freq, re);
-  // Packed (re, im) pairs viewed as a 2 x K array, so the squared magnitude
-  // is one vectorised expression.
-  Eigen::Map<Eigen::ArrayXXd> fq(
-      reinterpret_cast<double*>(freq.data()), 2,
-      static_cast<Eigen::Index>(freq.size()));
-  fq.row(0) = fq.row(0).square() + fq.row(1).square();
-  fq.row(1).setZero();
-  fft.inv(re, freq);
+  // In-place real -> FFTPACK-packed spectrum: re[0]=DC, re[2k-1..2k]=bin k's
+  // (re,im) for k=1..M-1, re[L-1]=Nyquist (L even).
+  plan.exec(re.data(), 1.0, true);
+  // Square each bin in place for the power spectrum -- a^2+b^2 doesn't care
+  // about the packed "imaginary" slot's sign, which becomes exactly 0 anyway.
+  re[0] *= re[0];
+  for (int i = 1; i < L - 1; i += 2) {
+    const double a = re[i], b = re[i + 1];
+    re[i] = a * a + b * b;
+    re[i + 1] = 0.0;
+  }
+  re[L - 1] *= re[L - 1];
+  // Inverse packed -> real gives the (unnormalised) autocovariance directly.
+  plan.exec(re.data(), 1.0, false);
   out.head(N) = Eigen::Map<const Eigen::VectorXd>(re.data(), N);
-  // Normalise: varx * (N - 1) == ss, so the (N - 1) factors cancel exactly.
+  // Normalise: varx * (N - 1) == ss, so the (N - 1) factors cancel exactly;
+  // also absorbs whatever raw scale the unnormalised round trip leaves.
   out *= (ss / N) / out[0];
 }
 
@@ -290,8 +326,7 @@ static double rhat_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
       return NA_REAL;
     }
   }
-  const Eigen::VectorXd cm =
-      chain_mean ? *chain_mean : x.colwise().mean();
+  const Eigen::VectorXd cm = chain_mean ? *chain_mean : x.colwise().mean();
   // cm must be transposed to a row vector for the rowwise broadcast.
   const double var_within =
       (x.array().rowwise() - cm.array().transpose()).matrix().squaredNorm() /
@@ -306,9 +341,7 @@ static double rhat_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
 
 static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
                         const Eigen::VectorXd* chain_mean,
-                        Eigen::FFT<double>& fft,
-                        std::vector<double>& fft_re,
-                        std::vector<std::complex<double>>& fft_freq) {
+                        const PocketPlan& plan, std::vector<double>& fft_re) {
   const int niter = x.rows();
   const int nchains = x.cols();
   // A non-null chain_mean means the caller already vetted this matrix.
@@ -319,15 +352,14 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
       chain_mean ? Eigen::VectorXd(*chain_mean) : x.colwise().mean();
   Eigen::MatrixXd acov(niter, nchains);
   for (int c = 0; c < nchains; c++) {
-    autocovariance(x.col(c), cm[c], fft, fft_re, fft_freq, acov.col(c));
+    autocovariance(x.col(c), cm[c], plan, fft_re, acov.col(c));
   }
   const Eigen::VectorXd acov_means = acov.rowwise().mean();
   const double mean_var = acov_means[0] * niter / (niter - 1.0);
   double var_plus = acov_means[0];
   if (nchains > 1) {
     const double mu = cm.mean();
-    var_plus +=
-        (cm.array() - mu).matrix().squaredNorm() / (nchains - 1);
+    var_plus += (cm.array() - mu).matrix().squaredNorm() / (nchains - 1);
   }
   std::vector<double> rho(niter, 0.0);
   int t = 0;
@@ -367,8 +399,7 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
   return ess / tau_hat;
 }
 
-static bool has_stat(const Rcpp::CharacterVector& stats,
-                     const char* name) {
+static bool has_stat(const Rcpp::CharacterVector& stats, const char* name) {
   for (R_xlen_t i = 0; i < stats.size(); i++) {
     if (stats[i] == name) {
       return true;
@@ -380,7 +411,7 @@ static bool has_stat(const Rcpp::CharacterVector& stats,
 // Shared work is computed once; unrequested stats skip computation entirely.
 // [[Rcpp::export]]
 Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
-                               Rcpp::CharacterVector stats) {
+                                Rcpp::CharacterVector stats) {
   const Rcpp::IntegerVector dim = draws.attr("dim");
   const int niter = dim[0];
   const int nchains = dim[1];
@@ -412,14 +443,17 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   const bool need_raw_ess = want_ess_basic || want_ess_mean || want_mcse_mean;
   const bool need_raw_bulk_pass = want_rhat_basic || need_raw_ess;
   const bool need_norm_bulk_pass = want_rhat || want_ess_bulk;
-  const bool need_var_val = want_sd || want_var || want_mcse_mean || want_mcse_sd;
+  const bool need_var_val =
+      want_sd || want_var || want_mcse_mean || want_mcse_sd;
   const bool need_ess_sd_val = want_ess_sd || want_mcse_sd;
   // Degeneracy survives split/z_scale/abs/indicator, so one range check on X
   // serves every rhat/ess path.
-  const bool need_x_degenerate = want_ess_tail || want_rhat_basic || want_rhat ||
-                                 want_ess_bulk || need_raw_ess || need_ess_sd_val;
+  const bool need_x_degenerate = want_ess_tail || want_rhat_basic ||
+                                 want_rhat || want_ess_bulk || need_raw_ess ||
+                                 need_ess_sd_val;
 
-  // Pre-filled with NA so NaN variables can `continue` without per-column writes.
+  // Pre-filled with NA so NaN variables can `continue` without per-column
+  // writes.
   Rcpp::NumericVector mean_out, median_out, sd_out, var_out, mad_out, q5_out,
       q95_out, rhat_out, rhat_basic_out, ess_bulk_out, ess_tail_out,
       ess_basic_out, ess_mean_out, ess_sd_out, mcse_mean_out, mcse_sd_out;
@@ -479,11 +513,16 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   const std::shared_ptr<const std::vector<double>> shared_qnorm_lut =
       need_z_scale ? qnorm_lut(split_chains_size(niter, nchains)) : nullptr;
 
+  // autocovariance() is the only pocketfft_plan() consumer; skip it otherwise.
+  const bool need_fft =
+      need_raw_ess || want_ess_bulk || want_ess_tail || need_ess_sd_val;
+  const std::shared_ptr<const PocketPlan> shared_pocketfft_plan =
+      need_fft ? pocketfft_plan(2 * nextn(post_split_niter(niter))) : nullptr;
+
   // auto_partitioner splits to one variable per chunk, so the body below runs
   // per variable, not per thread; scratch must live out here to be reused.
   struct Scratch {
     std::vector<double> sorted, abs_dev, fft_re;
-    std::vector<std::complex<double>> fft_freq;
     ZScratch zsc;
     bool init = false;
   };
@@ -492,12 +531,8 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   tbb::parallel_for(
       tbb::blocked_range<int>(0, nvars),
       [&](const tbb::blocked_range<int>& range) {
-        // fft caches plans by nfft internally; thread_local keeps that cache
-        // alive across calls on this OS thread, not just within one call.
-        thread_local Eigen::FFT<double> fft;
         Scratch& sc = scratch.local();
         if (!sc.init) {
-          fft.SetFlag(Eigen::FFT<double>::HalfSpectrum);
           if (need_sorted) {
             sc.sorted.resize(n);
           }
@@ -509,7 +544,6 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
         std::vector<double>& sorted = sc.sorted;
         std::vector<double>& abs_dev = sc.abs_dev;
         std::vector<double>& fft_re = sc.fft_re;
-        std::vector<std::complex<double>>& fft_freq = sc.fft_freq;
         ZScratch& zsc = sc.zsc;
 
         for (int v = range.begin(); v != range.end(); ++v) {
@@ -580,14 +614,12 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
                 std::lower_bound(sorted.begin(), sorted.end(), median_val);
             const int n_left = static_cast<int>(middle - sorted.begin());
             Eigen::Map<Eigen::ArrayXd> dev(abs_dev.data(), n);
-            dev.head(n_left) =
-                median_val -
-                Eigen::Map<const Eigen::ArrayXd>(sorted.data(), n_left)
-                    .reverse();
-            dev.tail(n - n_left) =
-                Eigen::Map<const Eigen::ArrayXd>(sorted.data() + n_left,
-                                                 n - n_left) -
-                median_val;
+            dev.head(n_left) = median_val - Eigen::Map<const Eigen::ArrayXd>(
+                                                sorted.data(), n_left)
+                                                .reverse();
+            dev.tail(n - n_left) = Eigen::Map<const Eigen::ArrayXd>(
+                                       sorted.data() + n_left, n - n_left) -
+                                   median_val;
             std::inplace_merge(dev.begin(), dev.begin() + n_left, dev.end());
             mad_out[v] = 1.4826 * quantile7(abs_dev, 0.5);
           }
@@ -606,14 +638,16 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
                 if (!is_degenerate(Xs)) {
                   const Eigen::VectorXd cm = Xs.colwise().mean();
                   rhat_basic_val = rhat_basic(Xs, &cm);
-                  ess_raw_val = ess_basic(Xs, &cm, fft, fft_re, fft_freq);
+                  ess_raw_val =
+                      ess_basic(Xs, &cm, *shared_pocketfft_plan, fft_re);
                 }
               } else {
                 if (want_rhat_basic) {
                   rhat_basic_val = rhat_basic(Xs);
                 }
                 if (need_raw_ess) {
-                  ess_raw_val = ess_basic(Xs, nullptr, fft, fft_re, fft_freq);
+                  ess_raw_val =
+                      ess_basic(Xs, nullptr, *shared_pocketfft_plan, fft_re);
                 }
               }
               if (want_rhat_basic) {
@@ -636,7 +670,8 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
                 if (!is_degenerate(Xsz)) {
                   const Eigen::VectorXd cm = Xsz.colwise().mean();
                   rhat_bulk = rhat_basic(Xsz, &cm);
-                  ess_bulk_out[v] = ess_basic(Xsz, &cm, fft, fft_re, fft_freq);
+                  ess_bulk_out[v] =
+                      ess_basic(Xsz, &cm, *shared_pocketfft_plan, fft_re);
                 }
               } else {
                 if (want_rhat) {
@@ -644,7 +679,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
                 }
                 if (want_ess_bulk) {
                   ess_bulk_out[v] =
-                      ess_basic(Xsz, nullptr, fft, fft_re, fft_freq);
+                      ess_basic(Xsz, nullptr, *shared_pocketfft_plan, fft_re);
                 }
               }
             }
@@ -668,10 +703,10 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
             if (!x_degenerate) {
               ess_q5 = ess_basic(
                   split_chains((X.array() <= q5_val).cast<double>().matrix()),
-                  nullptr, fft, fft_re, fft_freq);
+                  nullptr, *shared_pocketfft_plan, fft_re);
               ess_q95 = ess_basic(
                   split_chains((X.array() <= q95_val).cast<double>().matrix()),
-                  nullptr, fft, fft_re, fft_freq);
+                  nullptr, *shared_pocketfft_plan, fft_re);
             }
             ess_tail_out[v] = na_min(ess_q5, ess_q95);
           }
@@ -681,7 +716,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           if (need_ess_sd_val && !x_degenerate) {
             ess_sd_val = ess_basic(
                 split_chains((X.array() - mean_val).square().matrix()), nullptr,
-                fft, fft_re, fft_freq);
+                *shared_pocketfft_plan, fft_re);
             if (want_ess_sd) {
               ess_sd_out[v] = ess_sd_val;
             }
