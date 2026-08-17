@@ -1,4 +1,4 @@
-Package: bayescpp
+Package: posteriorcpp
 Title: Fast C++ Implementations of Posterior Draws Summaries
 Version: 0.0.0.9000
 Authors@R:
@@ -22,6 +22,6 @@ Imports:
 SystemRequirements: C++20, GNU make
 Config/roxygen2/version: 8.1.0
 Config/build/compilation-database: true
-Suggests: 
+Suggests:
     testthat (>= 3.0.0)
 Config/testthat/edition: 3

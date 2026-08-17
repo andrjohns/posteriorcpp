@@ -1,11 +1,12 @@
 #' @keywords internal
-.bayescpp_all_stats <- c(
+.posteriorcpp_all_stats <- c(
   "mean", "median", "sd", "var", "mad", "q5", "q95",
-  "rhat", "rhat_basic", "ess_bulk", "ess_tail", "ess_basic"
+  "rhat", "rhat_basic", "ess_bulk", "ess_tail", "ess_basic",
+  "ess_mean", "ess_sd", "mcse_mean", "mcse_sd"
 )
 
 #' @keywords internal
-.bayescpp_default_stats <- c(
+.posteriorcpp_default_stats <- c(
   "mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail"
 )
 
@@ -21,33 +22,38 @@
 #' @param stats Character vector of statistics to compute. The default is
 #'   `"mean"`, `"median"`, `"sd"`, `"mad"`, `"q5"`, `"q95"`, `"rhat"`,
 #'   `"ess_bulk"`, `"ess_tail"` — matching `posterior::summarise_draws()`'s
-#'   own default set exactly. Two more are available opt-in:
-#'   `"var"` (variance, i.e. `sd^2`) and the unnormalised diagnostics
-#'   `"rhat_basic"`/`"ess_basic"` (matching `posterior::rhat_basic()`/
-#'   `posterior::ess_basic()` — split-chains without the rank-normalising
-#'   z-score step that `"rhat"`/`"ess_bulk"` apply). Output columns are
-#'   always in the fixed canonical order above regardless of how `stats` is
-#'   ordered. Statistics that share underlying work (e.g. `"rhat"` and
-#'   `"ess_bulk"` both rank-normalise and split the chains; `"rhat_basic"`
-#'   and `"rhat"` both start from the same unnormalised split) still only do
-#'   that work once, but requesting fewer statistics skips work that only
-#'   unrequested statistics need — e.g. `stats = c("mean", "sd")` skips
-#'   sorting, rank-normalisation, and FFT autocovariance entirely.
+#'   own default set exactly. More are available opt-in, each matching its
+#'   `posterior` equivalent: `"var"` (variance, i.e. `sd^2`); the unnormalised
+#'   diagnostics `"rhat_basic"`/`"ess_basic"` (split-chains without the
+#'   rank-normalising z-score step that `"rhat"`/`"ess_bulk"` apply);
+#'   `"ess_mean"` (identical to `"ess_basic"`, the ESS of the mean
+#'   estimator); `"ess_sd"` (ESS of the squared centered draws, i.e. of the
+#'   SD estimator); and the Monte Carlo standard errors `"mcse_mean"`
+#'   (`sd / sqrt(ess_mean)`) and `"mcse_sd"` (first-order Taylor
+#'   approximation per Kenney & Keeping 1951). Output columns are always in
+#'   the fixed canonical order above regardless of how `stats` is ordered.
+#'   Statistics that share underlying work (e.g. `"rhat"` and `"ess_bulk"`
+#'   both rank-normalise and split the chains; `"rhat_basic"` and `"rhat"`
+#'   both start from the same unnormalised split; `"mcse_sd"` reuses
+#'   `"ess_sd"`'s ESS as its own denominator) still only do that work once,
+#'   but requesting fewer statistics skips work that only unrequested
+#'   statistics need — e.g. `stats = c("mean", "sd")` skips sorting,
+#'   rank-normalisation, and FFT autocovariance entirely.
 #' @return A [tibble][tibble::tibble] with one row per variable and one
 #'   column per requested statistic.
 #' @export
-summarise_draws <- function(x, stats = .bayescpp_default_stats) {
+summarise_draws <- function(x, stats = .posteriorcpp_default_stats) {
   if (length(stats) == 0L) {
     stop("`stats` must specify at least one statistic to compute.")
   }
-  unknown <- setdiff(stats, .bayescpp_all_stats)
+  unknown <- setdiff(stats, .posteriorcpp_all_stats)
   if (length(unknown) > 0L) {
     stop(sprintf(
       "Unknown `stats`: %s. Must be one or more of: %s.",
-      paste(unknown, collapse = ", "), paste(.bayescpp_all_stats, collapse = ", ")
+      paste(unknown, collapse = ", "), paste(.posteriorcpp_all_stats, collapse = ", ")
     ))
   }
-  stats <- .bayescpp_all_stats[.bayescpp_all_stats %in% stats]
+  stats <- .posteriorcpp_all_stats[.posteriorcpp_all_stats %in% stats]
 
   x <- posterior::as_draws(x)
   x <- posterior::repair_draws(x)
@@ -63,7 +69,7 @@ summarise_draws <- function(x, stats = .bayescpp_default_stats) {
     ))
   }
 
-  want <- .bayescpp_all_stats %in% stats
+  want <- .posteriorcpp_all_stats %in% stats
   out <- summarise_draws_cpp(unclass(x), want)
   out$variable <- vars
 

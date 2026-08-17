@@ -7,6 +7,6 @@
 # * https://testthat.r-lib.org/articles/special-files.html
 
 library(testthat)
-library(bayescpp)
+library(posteriorcpp)
 
-test_check("bayescpp")
+test_check("posteriorcpp")

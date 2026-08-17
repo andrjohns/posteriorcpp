@@ -4,6 +4,6 @@
 ## usethis namespace: start
 #' @importFrom Rcpp sourceCpp
 #' @importFrom RcppParallel RcppParallelLibs
-#' @useDynLib bayescpp, .registration = TRUE
+#' @useDynLib posteriorcpp, .registration = TRUE
 ## usethis namespace: end
 NULL

@@ -1,4 +1,4 @@
-# Shared helpers for comparing bayescpp::summarise_draws() against
+# Shared helpers for comparing posteriorcpp::summarise_draws() against
 # posterior::summarise_draws() across many draws shapes and stat subsets.
 
 make_draws <- function(niter, nchains, nvars, seed = NULL, fun = stats::rnorm) {
@@ -10,9 +10,9 @@ make_draws <- function(niter, nchains, nvars, seed = NULL, fun = stats::rnorm) {
 
 all_stats <- c("mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail")
 
-# Compares bayescpp::summarise_draws(x, stats) against posterior's default
+# Compares posteriorcpp::summarise_draws(x, stats) against posterior's default
 # (single-core) summary, column by column. Tolerance is 1e-4 rather than
-# something tighter because bayescpp's real-input FFT and posterior's
+# something tighter because posteriorcpp's real-input FFT and posterior's
 # complex-to-complex FFT accumulate floating point error differently; for
 # almost all variables this differs at the 1e-10-1e-12 level, but the
 # rhat/ess rho-truncation recursion (Geyer's initial monotone sequence) has
@@ -23,9 +23,9 @@ all_stats <- c("mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "
 # genuine correctness bug would produce.
 expect_matches_posterior <- function(x, stats = NULL, tolerance = 1e-4) {
   a <- if (is.null(stats)) {
-    bayescpp::summarise_draws(x)
+    posteriorcpp::summarise_draws(x)
   } else {
-    bayescpp::summarise_draws(x, stats = stats)
+    posteriorcpp::summarise_draws(x, stats = stats)
   }
   b <- posterior::summarise_draws(x)
 

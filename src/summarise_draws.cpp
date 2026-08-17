@@ -219,10 +219,12 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
   return ess / tau_hat;
 }
 
-// `want` is a length-12 logical vector in the fixed canonical order: mean,
+// `want` is a length-16 logical vector in the fixed canonical order: mean,
 // median, sd, var, mad, q5, q95, rhat, rhat_basic, ess_bulk, ess_tail,
-// ess_basic. Statistics that share underlying work (e.g. rhat and ess_bulk
-// both need z_scale(split_chains(x))) still only compute that shared work
+// ess_basic, ess_mean, ess_sd, mcse_mean, mcse_sd. Statistics that share
+// underlying work (e.g. rhat and ess_bulk both need z_scale(split_chains(x));
+// ess_mean is exactly ess_basic under another name; mcse_sd and ess_sd share
+// the ESS of the squared centered draws) still only compute that shared work
 // once; statistics that aren't requested skip their computation (and output
 // column) entirely rather than being computed and discarded.
 // [[Rcpp::export]]
@@ -246,24 +248,33 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   const bool want_ess_bulk = want[9];
   const bool want_ess_tail = want[10];
   const bool want_ess_basic = want[11];
+  const bool want_ess_mean = want[12];
+  const bool want_ess_sd = want[13];
+  const bool want_mcse_mean = want[14];
+  const bool want_mcse_sd = want[15];
 
   // Sorting the flattened draws is only needed to derive median/q5/q95 (and
   // mad, and rhat's folded-tail split, and ess_tail's quantile indicators) —
   // if none of those are requested, skip the sort entirely.
   const bool need_sort = want_median || want_mad || want_q5 || want_q95 ||
                          want_rhat || want_ess_tail;
-  // rhat_basic/ess_basic need split_chains(x) unnormalised; rhat/ess_bulk
-  // need it rank-normalised (z_scale) on top. Both start from the same
+  // rhat_basic/ess_basic/ess_mean/mcse_mean all need split_chains(x)
+  // unnormalised (ess_mean(x) is defined identically to ess_basic(x), and
+  // mcse_mean needs that same ESS as its denominator); rhat/ess_bulk need it
+  // rank-normalised (z_scale) on top. Both start from the same
   // split_chains(x), so that's only computed once for either.
-  const bool need_raw_bulk_pass = want_rhat_basic || want_ess_basic;
+  const bool need_raw_ess = want_ess_basic || want_ess_mean || want_mcse_mean;
+  const bool need_raw_bulk_pass = want_rhat_basic || need_raw_ess;
   const bool need_norm_bulk_pass = want_rhat || want_ess_bulk;
+  const bool need_sd_val = want_sd || want_var || want_mcse_mean;
+  const bool need_ess_sd_val = want_ess_sd || want_mcse_sd;
 
   // Pre-filled with NA so a NaN-containing variable can just `continue`
   // without writing NA to every requested column individually below — every
   // other code path always overwrites its column explicitly.
   Rcpp::NumericVector mean_out, median_out, sd_out, var_out, mad_out, q5_out,
       q95_out, rhat_out, rhat_basic_out, ess_bulk_out, ess_tail_out,
-      ess_basic_out;
+      ess_basic_out, ess_mean_out, ess_sd_out, mcse_mean_out, mcse_sd_out;
   if (want_mean) {
     mean_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
@@ -300,6 +311,18 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   if (want_ess_basic) {
     ess_basic_out = Rcpp::NumericVector(nvars, NA_REAL);
   }
+  if (want_ess_mean) {
+    ess_mean_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
+  if (want_ess_sd) {
+    ess_sd_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
+  if (want_mcse_mean) {
+    mcse_mean_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
+  if (want_mcse_sd) {
+    mcse_sd_out = Rcpp::NumericVector(nvars, NA_REAL);
+  }
 
   const int n = niter * nchains;
 
@@ -328,11 +351,13 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           if (want_mean) {
             mean_out[v] = mean_val;
           }
-          if (want_sd || want_var) {
+          double sd_val = NA_REAL;
+          if (need_sd_val) {
             const double var_val =
                 (X.array() - mean_val).square().sum() / (n - 1);
+            sd_val = std::sqrt(var_val);
             if (want_sd) {
-              sd_out[v] = std::sqrt(var_val);
+              sd_out[v] = sd_val;
             }
             if (want_var) {
               var_out[v] = var_val;
@@ -366,13 +391,20 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           }
 
           double rhat_bulk = NA_REAL;
+          double ess_raw_val = NA_REAL;  // = ess_basic(x) = ess_mean(x)
           if (need_raw_bulk_pass || need_norm_bulk_pass) {
             const Eigen::MatrixXd Xs = split_chains(X);
             if (want_rhat_basic) {
               rhat_basic_out[v] = rhat_basic(Xs);
             }
-            if (want_ess_basic) {
-              ess_basic_out[v] = ess_basic(Xs, fft);
+            if (need_raw_ess) {
+              ess_raw_val = ess_basic(Xs, fft);
+              if (want_ess_basic) {
+                ess_basic_out[v] = ess_raw_val;
+              }
+              if (want_ess_mean) {
+                ess_mean_out[v] = ess_raw_val;
+              }
             }
             if (need_norm_bulk_pass) {
               const Eigen::MatrixXd Xsz = z_scale(Xs);
@@ -383,6 +415,9 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
                 ess_bulk_out[v] = ess_basic(Xsz, fft);
               }
             }
+          }
+          if (want_mcse_mean) {
+            mcse_mean_out[v] = sd_val / std::sqrt(ess_raw_val);
           }
 
           double rhat_tail = NA_REAL;
@@ -405,6 +440,27 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
                   fft);
             }
             ess_tail_out[v] = na_min(ess_q5, ess_q95);
+          }
+
+          // ess_sd(x) = ess of the squared centered draws (unnormalised,
+          // split); mcse_sd reuses that exact ESS as its own denominator, so
+          // both are gated on the same underlying value.
+          double ess_sd_val = NA_REAL;
+          if (need_ess_sd_val) {
+            const Eigen::MatrixXd centered_sq =
+                (X.array() - mean_val).square().matrix();
+            ess_sd_val = ess_basic(split_chains(centered_sq), fft);
+            if (want_ess_sd) {
+              ess_sd_out[v] = ess_sd_val;
+            }
+          }
+          if (want_mcse_sd) {
+            const auto centered = (X.array() - mean_val);
+            const double e_var = centered.square().mean();
+            const double e_var4 = centered.square().square().mean();
+            const double var_of_var = (e_var4 - e_var * e_var) / ess_sd_val;
+            const double var_of_sd = var_of_var / e_var / 4.0;
+            mcse_sd_out[v] = std::sqrt(var_of_sd);
           }
         }
       });
@@ -445,6 +501,18 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
   }
   if (want_ess_basic) {
     out["ess_basic"] = ess_basic_out;
+  }
+  if (want_ess_mean) {
+    out["ess_mean"] = ess_mean_out;
+  }
+  if (want_ess_sd) {
+    out["ess_sd"] = ess_sd_out;
+  }
+  if (want_mcse_mean) {
+    out["mcse_mean"] = mcse_mean_out;
+  }
+  if (want_mcse_sd) {
+    out["mcse_sd"] = mcse_sd_out;
   }
   return out;
 }

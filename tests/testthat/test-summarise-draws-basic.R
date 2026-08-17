@@ -1,6 +1,6 @@
 test_that("returns a tibble with one row per variable and the default columns", {
   x <- make_draws(200, 4, 5, seed = 1)
-  out <- bayescpp::summarise_draws(x)
+  out <- posteriorcpp::summarise_draws(x)
 
   expect_s3_class(out, "tbl_df")
   expect_equal(nrow(out), 5)
@@ -10,7 +10,7 @@ test_that("returns a tibble with one row per variable and the default columns", 
 
 test_that("column types are as expected", {
   x <- make_draws(200, 4, 3, seed = 2)
-  out <- bayescpp::summarise_draws(x)
+  out <- posteriorcpp::summarise_draws(x)
 
   expect_type(out$variable, "character")
   for (cn in all_stats) {
@@ -20,12 +20,12 @@ test_that("column types are as expected", {
 
 test_that("summarize_draws (US spelling) is identical to summarise_draws", {
   x <- make_draws(200, 4, 4, seed = 3)
-  expect_identical(bayescpp::summarise_draws(x), bayescpp::summarize_draws(x))
+  expect_identical(posteriorcpp::summarise_draws(x), posteriorcpp::summarize_draws(x))
 
   x2 <- make_draws(200, 4, 4, seed = 4)
   expect_identical(
-    bayescpp::summarise_draws(x2, stats = c("mean", "rhat")),
-    bayescpp::summarize_draws(x2, stats = c("mean", "rhat"))
+    posteriorcpp::summarise_draws(x2, stats = c("mean", "rhat")),
+    posteriorcpp::summarize_draws(x2, stats = c("mean", "rhat"))
   )
 })
 
@@ -42,7 +42,7 @@ test_that("accepts draws-coercible input types, not just draws_array", {
 
 test_that("empty draws object returns an empty tibble with just the variable column", {
   x <- make_draws(100, 2, 0, seed = 6)
-  out <- bayescpp::summarise_draws(x)
+  out <- posteriorcpp::summarise_draws(x)
   expect_equal(nrow(out), 0)
   expect_identical(names(out), "variable")
 })

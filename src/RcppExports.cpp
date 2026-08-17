@@ -13,7 +13,7 @@ Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 
 // summarise_draws_cpp
 Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws, Rcpp::LogicalVector want);
-RcppExport SEXP _bayescpp_summarise_draws_cpp(SEXP drawsSEXP, SEXP wantSEXP) {
+RcppExport SEXP _posteriorcpp_summarise_draws_cpp(SEXP drawsSEXP, SEXP wantSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -25,11 +25,11 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
-    {"_bayescpp_summarise_draws_cpp", (DL_FUNC) &_bayescpp_summarise_draws_cpp, 2},
+    {"_posteriorcpp_summarise_draws_cpp", (DL_FUNC) &_posteriorcpp_summarise_draws_cpp, 2},
     {NULL, NULL, 0}
 };
 
-RcppExport void R_init_bayescpp(DllInfo *dll) {
+RcppExport void R_init_posteriorcpp(DllInfo *dll) {
     R_registerRoutines(dll, NULL, CallEntries, NULL, NULL);
     R_useDynamicSymbols(dll, FALSE);
 }
