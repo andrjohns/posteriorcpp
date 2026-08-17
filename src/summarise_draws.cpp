@@ -2,22 +2,21 @@
 // [[Rcpp::depends(RcppParallel)]]
 #include <RcppEigen.h>
 #include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
 
 #include <algorithm>
 #include <cmath>
 #include <complex>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <unsupported/Eigen/FFT>
 #include <vector>
 
 static constexpr double EPS = std::numeric_limits<double>::epsilon();
 
-// std::min/std::max do not reliably propagate NaN (they return whichever
-// argument compares "not less than" the other under `<`, and NaN
-// comparisons are always false, so the result silently depends on argument
-// order). R's min()/max() always return NA if either input is NA. These
-// match R's semantics.
+// Match R's NA-propagating min()/max() (std::min/max don't propagate NaN).
 static double na_min(double a, double b) {
   return (std::isnan(a) || std::isnan(b)) ? NA_REAL : std::min(a, b);
 }
@@ -26,8 +25,7 @@ static double na_max(double a, double b) {
   return (std::isnan(a) || std::isnan(b)) ? NA_REAL : std::max(a, b);
 }
 
-// A matrix is "degenerate" for rhat/ess purposes if it has non-finite
-// entries or every entry is (numerically) identical.
+// Degenerate for rhat/ess: non-finite or all entries identical.
 static bool is_degenerate(const Eigen::Ref<const Eigen::MatrixXd>& x) {
   return !x.allFinite() || (x.maxCoeff() - x.minCoeff()) < EPS;
 }
@@ -38,6 +36,40 @@ static double quantile7(const std::vector<double>& sorted, double p) {
   const int lo = static_cast<int>(std::floor(h));
   const int hi = static_cast<int>(std::ceil(h));
   return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+}
+
+// Place the k-th and (k+1)-th order statistics of [first, last) at
+// *(first + k) and *(first + k + 1); the remaining elements are only
+// partitioned, not sorted.
+static inline void order_pair(double* first, double* last, int k) {
+  std::nth_element(first, first + k, last);
+  std::nth_element(first + k + 1, first + k + 1, last);
+}
+
+// Type-7 quantiles at p = 0.05 / 0.5 / 0.95 via nested selection (~3 linear
+// passes) instead of one O(n log n) sort. Buffer contents are destroyed.
+// The median pair partitions the buffer -- ranks below it go left, ranks
+// above go right -- so each side quantile recurses into its half only.
+// Requires >= 4 elements (that is when the rank bounds below hold); trivial
+// sizes fall back to a full sort at the call site.
+static void quantiles7_select(std::vector<double>& buf, double& q05,
+                              double& q50, double& q95) {
+  const int n = static_cast<int>(buf.size());
+  double* const b = buf.data();
+  const double h5 = (n - 1) * 0.05, h50 = (n - 1) * 0.50, h95 = (n - 1) * 0.95;
+  const int lo5 = static_cast<int>(std::floor(h5));
+  const int lo50 = static_cast<int>(std::floor(h50));
+  const int lo95 = static_cast<int>(std::floor(h95));
+  // For n >= 4 one can show ceil(h5) <= lo50 and floor(h95) >= lo50 + 1,
+  // so the side quantile never needs an element from the other half.
+  order_pair(b, b + n, lo50);
+  q50 = b[lo50] + (h50 - lo50) * (b[lo50 + 1] - b[lo50]);
+  order_pair(b, b + lo50 + 1, lo5);  // ranks 0..lo50 live here
+  q05 = b[lo5] + (h5 - lo5) * (b[lo5 + 1] - b[lo5]);
+  double* const u = b + lo50 + 1;  // ranks lo50+1..n-1 live here
+  order_pair(u, b + n, lo95 - (lo50 + 1));
+  const int r95 = lo95 - (lo50 + 1);
+  q95 = u[r95] + (h95 - lo95) * (u[r95 + 1] - u[r95]);
 }
 
 template <typename Derived>
@@ -53,42 +85,141 @@ static Eigen::MatrixXd split_chains(const Eigen::MatrixBase<Derived>& x) {
   return out;
 }
 
-static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x) {
-  const int S = x.size();
-  const double* const data = x.data();
-  // Sort contiguous (value, index) pairs rather than an index array that
-  // dereferences `data` on every comparison — much better cache locality.
-  std::vector<std::pair<double, int>> sorted(S);
-  for (int i = 0; i < S; i++) {
-    sorted[i] = {data[i], i};
+// Reusable buffers for z_scale: radix-sort working arrays, the rank vector and
+// the qnorm table. Held by the caller so both the bulk and tail z-scalings of a
+// variable share one allocation.
+struct ZScratch {
+  std::vector<std::uint64_t> ka, kb;  // sort keys, ping-pong buffers
+  std::vector<int> ia, ib;            // permutation, ping-pong buffers
+  std::vector<double> rank;
+  std::vector<std::pair<double, int>> pbuf;  // comparison-sort fallback
+  std::vector<double> lut;                   // qnorm at integer ranks 1..S
+  int lut_S = -1;
+};
+
+// Order-preserving map from double to uint64: for all non-NaN values the
+// unsigned ordering of the keys matches < on the doubles, so ranks can be
+// produced by an integer radix sort.
+static inline std::uint64_t sortable_key(double d) {
+  std::uint64_t u;
+  std::memcpy(&u, &d, sizeof(u));
+  return (u & 0x8000000000000000ULL) ? ~u : (u | 0x8000000000000000ULL);
+}
+
+// Radix sort only beats introsort once the array is large enough that the
+// comparison sort's cache behaviour dominates. Measured crossover on Apple
+// silicon is near S = 1400 (S = 1280: 0.92x, S = 1536: 1.15x, S = 4096: 3.1x),
+// so this sits just above it; below, the pair sort is faster.
+static constexpr int RADIX_MIN = 1536;
+
+// 1-based ranks with ties averaged, written to sc.rank in input order.
+static void average_ranks(const double* data, int S, ZScratch& sc) {
+  if (S < RADIX_MIN) {
+    // Sort (value, index) pairs for cache locality.
+    sc.pbuf.resize(S);
+    for (int i = 0; i < S; i++) {
+      sc.pbuf[i] = {data[i], i};
+    }
+    std::sort(sc.pbuf.begin(), sc.pbuf.end(),
+              [](const std::pair<double, int>& a,
+                 const std::pair<double, int>& b) { return a.first < b.first; });
+    sc.rank.resize(S);
+    int i = 0;
+    while (i < S) {
+      int j = i;
+      while (j + 1 < S && sc.pbuf[j + 1].first == sc.pbuf[i].first) {
+        j++;
+      }
+      const double avg_rank = (i + j) / 2.0 + 1.0;
+      for (int k = i; k <= j; k++) {
+        sc.rank[sc.pbuf[k].second] = avg_rank;
+      }
+      i = j + 1;
+    }
+    return;
   }
-  std::sort(sorted.begin(), sorted.end(),
-            [](const std::pair<double, int>& a,
-               const std::pair<double, int>& b) { return a.first < b.first; });
-  std::vector<double> rank(S);
+  sc.ka.resize(S);
+  sc.kb.resize(S);
+  sc.ia.resize(S);
+  sc.ib.resize(S);
+  for (int i = 0; i < S; i++) {
+    sc.ka[i] = sortable_key(data[i]);
+    sc.ia[i] = i;
+  }
+  // One counting pass builds all eight byte histograms up front; a pass whose
+  // digit is constant across the array leaves the order unchanged and is
+  // skipped, which typically removes the high-order exponent bytes.
+  int hist[8][256];
+  std::memset(hist, 0, sizeof(hist));
+  for (int i = 0; i < S; i++) {
+    const std::uint64_t k = sc.ka[i];
+    for (int p = 0; p < 8; p++) {
+      hist[p][(k >> (8 * p)) & 0xFF]++;
+    }
+  }
+  for (int p = 0; p < 8; p++) {
+    const int sh = 8 * p;
+    if (hist[p][(sc.ka[0] >> sh) & 0xFF] == S) {
+      continue;
+    }
+    int off[256], sum = 0;
+    for (int d = 0; d < 256; d++) {
+      off[d] = sum;
+      sum += hist[p][d];
+    }
+    for (int i = 0; i < S; i++) {
+      const int o = off[(sc.ka[i] >> sh) & 0xFF]++;
+      sc.kb[o] = sc.ka[i];
+      sc.ib[o] = sc.ia[i];
+    }
+    sc.ka.swap(sc.kb);
+    sc.ia.swap(sc.ib);
+  }
+  // Keys compare equal exactly when the doubles did, so the tie scan runs on
+  // the integer keys.
+  sc.rank.resize(S);
   int i = 0;
   while (i < S) {
     int j = i;
-    while (j + 1 < S && sorted[j + 1].first == sorted[i].first) {
+    while (j + 1 < S && sc.ka[j + 1] == sc.ka[i]) {
       j++;
     }
     const double avg_rank = (i + j) / 2.0 + 1.0;
     for (int k = i; k <= j; k++) {
-      rank[sorted[k].second] = avg_rank;
+      sc.rank[sc.ia[k]] = avg_rank;
     }
     i = j + 1;
   }
+}
+
+static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
+                               ZScratch& sc) {
+  const int S = x.size();
+  average_ranks(x.data(), S, sc);
   constexpr double c = 3.0 / 8.0;
   const double denom = S - 2 * c + 1;
+  // Untied ranks are exactly the integers 1..S, so qnorm has only S distinct
+  // arguments -- tabulate them once per scratch instance and reuse across both
+  // the bulk and tail z-scalings. Tied ranks average to half-integers and fall
+  // back to the direct call, so the results are unchanged either way.
+  if (sc.lut_S != S) {
+    sc.lut.resize(S);
+    for (int k = 0; k < S; k++) {
+      sc.lut[k] = R::qnorm((k + 1 - c) / denom, 0.0, 1.0, 1, 0);
+    }
+    sc.lut_S = S;
+  }
   Eigen::MatrixXd z(x.rows(), x.cols());
   for (int k = 0; k < S; k++) {
-    z.data()[k] = R::qnorm((rank[k] - c) / denom, 0.0, 1.0, 1, 0);
+    const double r = sc.rank[k];
+    const int ir = static_cast<int>(r);
+    z.data()[k] = (r == ir) ? sc.lut[ir - 1]
+                            : R::qnorm((r - c) / denom, 0.0, 1.0, 1, 0);
   }
   return z;
 }
 
-// Next 5-smooth number >= n that is also a multiple of 4, so that kissfft's
-// optimized real-FFT path (which requires nfft % 4 == 0) is always used.
+// Next 5-smooth multiple of 4 >= n (kissfft real-FFT needs nfft % 4 == 0).
 static int nextn(int n) {
   for (int cand = n;; cand++) {
     if (cand % 2 != 0) {
@@ -111,72 +242,94 @@ static int nextn(int n) {
 }
 
 static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
+                           const double xmean,
                            Eigen::FFT<double>& fft,
+                           std::vector<double>& re,               // scratch
+                           std::vector<std::complex<double>>& freq,  // scratch
                            Eigen::Ref<Eigen::VectorXd> out) {
   const int N = x.size();
-  const double xmean = x.mean();
-  const double varx = (x.array() - xmean).square().sum() / (N - 1);
-  if (varx == 0.0) {
+  const int M = nextn(N);
+  // Zero-padded, mean-centred input, materialised once into the reusable
+  // scratch buffer. The chain mean is supplied by the caller (one pass over
+  // all chains serves every column), not recomputed per column.
+  re.assign(2 * M, 0.0);
+  Eigen::Map<Eigen::VectorXd>(re.data(), N) = x.array() - xmean;
+  // Sum of squared centred deviations (= sample variance * (N - 1)).
+  const double ss =
+      Eigen::Map<const Eigen::VectorXd>(re.data(), N).squaredNorm();
+  if (ss == 0.0) {
     out.setZero();
     return;
   }
-  const int M = nextn(N);
-  const int Mt2 = 2 * M;
-  // Real-input FFT: works on the Hermitian half-spectrum instead of a
-  // zero-imaginary complex signal, roughly halving the FFT arithmetic.
-  std::vector<double> re(Mt2, 0.0);
-  std::vector<std::complex<double>> freq;
-  for (int i = 0; i < N; i++) {
-    re[i] = x[i] - xmean;
-  }
+  // Real-input FFT halves arithmetic via the Hermitian half-spectrum.
   fft.fwd(freq, re);
-  for (auto& z : freq) {
-    z = std::complex<double>(std::norm(z), 0.0);
-  }
+  // Power spectrum. Reinterpret the packed (re, im) pairs as a 2 x K column
+  // array so the squared magnitude is one vectorised expression.
+  Eigen::Map<Eigen::ArrayXXd> fq(
+      reinterpret_cast<double*>(freq.data()), 2,
+      static_cast<Eigen::Index>(freq.size()));
+  fq.row(0) = fq.row(0).square() + fq.row(1).square();
+  fq.row(1).setZero();
   fft.inv(re, freq);
-  for (int i = 0; i < N; i++) {
-    out[i] = re[i];
-  }
-  out *= varx * (N - 1) / N / out[0];
+  out.head(N) = Eigen::Map<const Eigen::VectorXd>(re.data(), N);
+  // Normalise: varx * (N - 1) == ss, so the (N - 1) factors cancel exactly.
+  out *= (ss / N) / out[0];
 }
 
-static double rhat_basic(const Eigen::Ref<const Eigen::MatrixXd>& x) {
+static double rhat_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
+                         const Eigen::VectorXd* chain_mean = nullptr) {
   const int niter = x.rows();
   const int nchains = x.cols();
-  if (is_degenerate(x)) {
-    return NA_REAL;
+  if (chain_mean == nullptr) {
+    // Callers that supply chain_mean have already vetted this matrix.
+    if (is_degenerate(x)) {
+      return NA_REAL;
+    }
   }
-  const Eigen::VectorXd chain_mean = x.colwise().mean();
-  double var_within = 0.0;
-  for (int c = 0; c < nchains; c++) {
-    var_within +=
-        (x.col(c).array() - chain_mean[c]).square().sum() / (niter - 1);
-  }
-  var_within /= nchains;
-  const double mu = chain_mean.mean();
-  const double var_between =
-      niter * (chain_mean.array() - mu).square().sum() / (nchains - 1);
-  return std::sqrt((var_between / var_within + niter - 1) / niter);
+  const Eigen::VectorXd cm =
+      chain_mean ? *chain_mean : x.colwise().mean();
+  // Broadcasts cm (one entry per chain/column) across the rows and reduces
+  // elementwise -- one vectorised expression instead of a per-chain loop.
+  // Note: cm must be a row vector for the rowwise broadcast.
+  const double var_within =
+      (x.array().rowwise() - cm.array().transpose()).matrix().squaredNorm() /
+      (niter - 1) / nchains;
+  const double mu = cm.mean();
+  // Spread of chain means, unscaled by niter: the between-chain variance is
+  // niter * chain_var, and the niter factor cancels the trailing division in
+  // (B / W + niter - 1) / niter, leaving chain_var / W + (niter - 1)/niter.
+  const double chain_var =
+      (cm.array() - mu).matrix().squaredNorm() / (nchains - 1);
+  return std::sqrt(chain_var / var_within + (niter - 1.0) / niter);
 }
 
 static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
-                        Eigen::FFT<double>& fft) {
+                        const Eigen::VectorXd* chain_mean,
+                        Eigen::FFT<double>& fft,
+                        std::vector<double>& fft_re,
+                        std::vector<std::complex<double>>& fft_freq) {
   const int niter = x.rows();
   const int nchains = x.cols();
-  if (niter < 3 || is_degenerate(x)) {
+  // A non-null chain_mean means the caller already vetted this same matrix
+  // (paired rhat/ess calls), so skip the redundant degeneracy check.
+  if (niter < 3 || (chain_mean == nullptr && is_degenerate(x))) {
     return NA_REAL;
   }
+  // One colwise mean pass serves both the autocovariance pass (centering
+  // each column) and the between-chain variance below.
+  const Eigen::VectorXd cm =
+      chain_mean ? Eigen::VectorXd(*chain_mean) : x.colwise().mean();
   Eigen::MatrixXd acov(niter, nchains);
   for (int c = 0; c < nchains; c++) {
-    autocovariance(x.col(c), fft, acov.col(c));
+    autocovariance(x.col(c), cm[c], fft, fft_re, fft_freq, acov.col(c));
   }
   const Eigen::VectorXd acov_means = acov.rowwise().mean();
   const double mean_var = acov_means[0] * niter / (niter - 1.0);
   double var_plus = acov_means[0];
   if (nchains > 1) {
-    const Eigen::VectorXd chain_mean = x.colwise().mean();
-    const double mu = chain_mean.mean();
-    var_plus += (chain_mean.array() - mu).square().sum() / (nchains - 1);
+    const double mu = cm.mean();
+    var_plus +=
+        (cm.array() - mu).matrix().squaredNorm() / (nchains - 1);
   }
   std::vector<double> rho(niter, 0.0);
   int t = 0;
@@ -206,10 +359,7 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
       rho[t + 1] = rho[t];
     }
   }
-  double sum_rho = 0.0;
-  for (int k = 0; k < max_t; k++) {
-    sum_rho += rho[k];
-  }
+  double sum_rho = Eigen::Map<const Eigen::VectorXd>(rho.data(), max_t).sum();
   double tau_hat = -1.0 + 2.0 * sum_rho + rho[max_t];
   const double ess = static_cast<double>(nchains) * niter;
   const double tau_bound = 1.0 / std::log10(ess);
@@ -219,59 +369,62 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
   return ess / tau_hat;
 }
 
-// `want` is a length-16 logical vector in the fixed canonical order: mean,
-// median, sd, var, mad, q5, q95, rhat, rhat_basic, ess_bulk, ess_tail,
-// ess_basic, ess_mean, ess_sd, mcse_mean, mcse_sd. Statistics that share
-// underlying work (e.g. rhat and ess_bulk both need z_scale(split_chains(x));
-// ess_mean is exactly ess_basic under another name; mcse_sd and ess_sd share
-// the ESS of the squared centered draws) still only compute that shared work
-// once; statistics that aren't requested skip their computation (and output
-// column) entirely rather than being computed and discarded.
+static bool has_stat(const Rcpp::CharacterVector& stats,
+                     const char* name) {
+  for (R_xlen_t i = 0; i < stats.size(); i++) {
+    if (stats[i] == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Shared work is computed once; unrequested stats skip computation entirely.
 // [[Rcpp::export]]
 Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
-                               Rcpp::LogicalVector want) {
+                               Rcpp::CharacterVector stats) {
   const Rcpp::IntegerVector dim = draws.attr("dim");
   const int niter = dim[0];
   const int nchains = dim[1];
   const int nvars = dim[2];
   const double* const ptr = draws.begin();
 
-  const bool want_mean = want[0];
-  const bool want_median = want[1];
-  const bool want_sd = want[2];
-  const bool want_var = want[3];
-  const bool want_mad = want[4];
-  const bool want_q5 = want[5];
-  const bool want_q95 = want[6];
-  const bool want_rhat = want[7];
-  const bool want_rhat_basic = want[8];
-  const bool want_ess_bulk = want[9];
-  const bool want_ess_tail = want[10];
-  const bool want_ess_basic = want[11];
-  const bool want_ess_mean = want[12];
-  const bool want_ess_sd = want[13];
-  const bool want_mcse_mean = want[14];
-  const bool want_mcse_sd = want[15];
+  const bool want_mean = has_stat(stats, "mean");
+  const bool want_median = has_stat(stats, "median");
+  const bool want_sd = has_stat(stats, "sd");
+  const bool want_var = has_stat(stats, "var");
+  const bool want_mad = has_stat(stats, "mad");
+  const bool want_q5 = has_stat(stats, "q5");
+  const bool want_q95 = has_stat(stats, "q95");
+  const bool want_rhat = has_stat(stats, "rhat");
+  const bool want_rhat_basic = has_stat(stats, "rhat_basic");
+  const bool want_ess_bulk = has_stat(stats, "ess_bulk");
+  const bool want_ess_tail = has_stat(stats, "ess_tail");
+  const bool want_ess_basic = has_stat(stats, "ess_basic");
+  const bool want_ess_mean = has_stat(stats, "ess_mean");
+  const bool want_ess_sd = has_stat(stats, "ess_sd");
+  const bool want_mcse_mean = has_stat(stats, "mcse_mean");
+  const bool want_mcse_sd = has_stat(stats, "mcse_sd");
 
-  // Sorting the flattened draws is only needed to derive median/q5/q95 (and
-  // mad, and rhat's folded-tail split, and ess_tail's quantile indicators) —
-  // if none of those are requested, skip the sort entirely.
-  const bool need_sort = want_median || want_mad || want_q5 || want_q95 ||
-                         want_rhat || want_ess_tail;
-  // rhat_basic/ess_basic/ess_mean/mcse_mean all need split_chains(x)
-  // unnormalised (ess_mean(x) is defined identically to ess_basic(x), and
-  // mcse_mean needs that same ESS as its denominator); rhat/ess_bulk need it
-  // rank-normalised (z_scale) on top. Both start from the same
-  // split_chains(x), so that's only computed once for either.
+  // Every quantile consumer (median, q5, q95 and mad) needs the draws in a
+  // scratch copy that carries order-statistic information. A full std::sort
+  // is required only for mad (its in-place merge needs total order) or tiny
+  // inputs; the scalar quantiles of larger inputs are served by selection.
+  const bool need_sorted = want_median || want_mad || want_q5 || want_q95 ||
+                           want_rhat || want_ess_tail;
+  // All bulk stats share split_chains(x); rhat/ess_bulk add z_scale on top.
   const bool need_raw_ess = want_ess_basic || want_ess_mean || want_mcse_mean;
   const bool need_raw_bulk_pass = want_rhat_basic || need_raw_ess;
   const bool need_norm_bulk_pass = want_rhat || want_ess_bulk;
-  const bool need_sd_val = want_sd || want_var || want_mcse_mean;
+  const bool need_var_val = want_sd || want_var || want_mcse_mean || want_mcse_sd;
   const bool need_ess_sd_val = want_ess_sd || want_mcse_sd;
+  // Degeneracy propagates through split/z_scale/abs/indicator transforms, so
+  // checking the range of X once serves every rhat/ess path that would
+  // otherwise re-run allFinite+maxCoeff+minCoeff internally.
+  const bool need_x_degenerate = want_ess_tail || want_rhat_basic || want_rhat ||
+                                 want_ess_bulk || need_raw_ess || need_ess_sd_val;
 
-  // Pre-filled with NA so a NaN-containing variable can just `continue`
-  // without writing NA to every requested column individually below — every
-  // other code path always overwrites its column explicitly.
+  // Pre-filled with NA so NaN variables can `continue` without per-column writes.
   Rcpp::NumericVector mean_out, median_out, sd_out, var_out, mad_out, q5_out,
       q95_out, rhat_out, rhat_basic_out, ess_bulk_out, ess_tail_out,
       ess_basic_out, ess_mean_out, ess_sd_out, mcse_mean_out, mcse_sd_out;
@@ -326,25 +479,60 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
 
   const int n = niter * nchains;
 
+  // blocked_range defaults to a grainsize of 1 and auto_partitioner splits all
+  // the way down, so the body below runs once per variable, not once per
+  // thread. Holding the scratch here keeps one set per worker thread -- the
+  // buffers, the FFT twiddle cache and the qnorm table are then built once each
+  // instead of nvars times -- while leaving work stealing untouched.
+  struct Scratch {
+    Eigen::FFT<double> fft;
+    std::vector<double> sorted, abs_dev, fft_re;
+    std::vector<std::complex<double>> fft_freq;
+    ZScratch zsc;
+    bool init = false;
+  };
+  tbb::enumerable_thread_specific<Scratch> scratch;
+
   tbb::parallel_for(
       tbb::blocked_range<int>(0, nvars),
       [&](const tbb::blocked_range<int>& range) {
-        Eigen::FFT<double> fft;
-        fft.SetFlag(Eigen::FFT<double>::HalfSpectrum);
-        std::vector<double> sorted, abs_dev;
-        if (need_sort) {
-          sorted.resize(n);
+        Scratch& sc = scratch.local();
+        if (!sc.init) {
+          sc.fft.SetFlag(Eigen::FFT<double>::HalfSpectrum);
+          if (need_sorted) {
+            sc.sorted.resize(n);
+          }
+          if (want_mad) {
+            sc.abs_dev.resize(n);
+          }
+          sc.init = true;
         }
-        if (want_mad) {
-          abs_dev.resize(n);
-        }
+        Eigen::FFT<double>& fft = sc.fft;
+        std::vector<double>& sorted = sc.sorted;
+        std::vector<double>& abs_dev = sc.abs_dev;
+        // Scratch buffers reused by autocovariance() for every ESS.
+        std::vector<double>& fft_re = sc.fft_re;
+        std::vector<std::complex<double>>& fft_freq = sc.fft_freq;
+        // Rank/qnorm scratch shared by both z_scale calls of a variable.
+        ZScratch& zsc = sc.zsc;
 
         for (int v = range.begin(); v != range.end(); ++v) {
           const Eigen::Map<const Eigen::MatrixXd> X(
               ptr + static_cast<std::size_t>(v) * n, niter, nchains);
 
           if (X.array().isNaN().any()) {
-            continue;  // outputs already NA-filled
+            continue;
+          }
+
+          // Degeneracy propagates through split_chains, z_scale, abs,
+          // indicator and square transforms, so one range check on X covers
+          // every downstream rhat/ess call that would otherwise re-run
+          // allFinite + maxCoeff + minCoeff on materialised copies. Inf is
+          // caught later (range == Inf means non-degenerate here, and the
+          // internal allFinite checks in rhat_basic/ess_basic still apply).
+          bool x_degenerate = false;
+          if (need_x_degenerate) {
+            x_degenerate = (X.maxCoeff() - X.minCoeff()) < EPS;
           }
 
           const double mean_val = X.mean();
@@ -352,10 +540,14 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
             mean_out[v] = mean_val;
           }
           double sd_val = NA_REAL;
-          if (need_sd_val) {
-            const double var_val =
-                (X.array() - mean_val).square().sum() / (n - 1);
-            sd_val = std::sqrt(var_val);
+          double var_val = NA_REAL;
+          double ss = NA_REAL;  // sum of squared centred draws
+          if (need_var_val) {
+            ss = (X.array() - mean_val).matrix().squaredNorm();
+            var_val = ss / (n - 1);
+            if (want_sd || want_var || want_mcse_mean) {
+              sd_val = std::sqrt(var_val);
+            }
             if (want_sd) {
               sd_out[v] = sd_val;
             }
@@ -365,12 +557,21 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           }
 
           double median_val = NA_REAL, q5_val = NA_REAL, q95_val = NA_REAL;
-          if (need_sort) {
+          if (need_sorted) {
             std::copy(X.data(), X.data() + n, sorted.begin());
-            std::sort(sorted.begin(), sorted.end());
-            median_val = quantile7(sorted, 0.5);
-            q5_val = quantile7(sorted, 0.05);
-            q95_val = quantile7(sorted, 0.95);
+            if (want_mad || n < 4) {
+              // Full order is needed for the mad merge below; trivial sizes
+              // sort in a handful of compares anyway.
+              std::sort(sorted.begin(), sorted.end());
+              median_val = quantile7(sorted, 0.5);
+              q5_val = quantile7(sorted, 0.05);
+              q95_val = quantile7(sorted, 0.95);
+            } else {
+              // Scalar quantiles only: nested selection in ~3 linear passes
+              // instead of O(n log n). Exact same values as quantile7() on a
+              // fully sorted buffer.
+              quantiles7_select(sorted, q5_val, median_val, q95_val);
+            }
             if (want_median) {
               median_out[v] = median_val;
             }
@@ -383,36 +584,82 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           }
 
           if (want_mad) {
-            for (int i = 0; i < n; i++) {
-              abs_dev[i] = std::fabs(sorted[i] - median_val);
-            }
-            std::sort(abs_dev.begin(), abs_dev.end());
+            // Median is known: for x <= median, (median - x) read from the
+            // median downwards is ascending; for x >= median, (x - median) is
+            // ascending. Both half-sequences are built as vectorised map
+            // assignments, then std::inplace_merge() does one linear merge in
+            // place instead of a full O(n log n) re-sort.
+            const auto middle =
+                std::lower_bound(sorted.begin(), sorted.end(), median_val);
+            const int n_left = static_cast<int>(middle - sorted.begin());
+            Eigen::Map<Eigen::ArrayXd> dev(abs_dev.data(), n);
+            dev.head(n_left) =
+                median_val -
+                Eigen::Map<const Eigen::ArrayXd>(sorted.data(), n_left)
+                    .reverse();
+            dev.tail(n - n_left) =
+                Eigen::Map<const Eigen::ArrayXd>(sorted.data() + n_left,
+                                                 n - n_left) -
+                median_val;
+            std::inplace_merge(dev.begin(), dev.begin() + n_left, dev.end());
             mad_out[v] = 1.4826 * quantile7(abs_dev, 0.5);
           }
 
           double rhat_bulk = NA_REAL;
-          double ess_raw_val = NA_REAL;  // = ess_basic(x) = ess_mean(x)
-          if (need_raw_bulk_pass || need_norm_bulk_pass) {
+          double ess_raw_val = NA_REAL;
+          // Degenerate variables yield NA for every rhat/ess stat; skip the
+          // splits, z-scaling and FFT passes entirely (outputs are pre-filled
+          // with NA).
+          if (!x_degenerate && (need_raw_bulk_pass || need_norm_bulk_pass)) {
             const Eigen::MatrixXd Xs = split_chains(X);
-            if (want_rhat_basic) {
-              rhat_basic_out[v] = rhat_basic(Xs);
-            }
-            if (need_raw_ess) {
-              ess_raw_val = ess_basic(Xs, fft);
-              if (want_ess_basic) {
-                ess_basic_out[v] = ess_raw_val;
+            if (need_raw_bulk_pass) {
+              double rhat_basic_val = NA_REAL;
+              if (want_rhat_basic && need_raw_ess) {
+                // Paired on the same matrix: one degeneracy check and one
+                // chain-means pass serve both stats.
+                if (!is_degenerate(Xs)) {
+                  const Eigen::VectorXd cm = Xs.colwise().mean();
+                  rhat_basic_val = rhat_basic(Xs, &cm);
+                  ess_raw_val = ess_basic(Xs, &cm, fft, fft_re, fft_freq);
+                }
+              } else {
+                if (want_rhat_basic) {
+                  rhat_basic_val = rhat_basic(Xs);
+                }
+                if (need_raw_ess) {
+                  ess_raw_val = ess_basic(Xs, nullptr, fft, fft_re, fft_freq);
+                }
               }
-              if (want_ess_mean) {
-                ess_mean_out[v] = ess_raw_val;
+              if (want_rhat_basic) {
+                rhat_basic_out[v] = rhat_basic_val;
+              }
+              if (need_raw_ess) {
+                if (want_ess_basic) {
+                  ess_basic_out[v] = ess_raw_val;
+                }
+                if (want_ess_mean) {
+                  ess_mean_out[v] = ess_raw_val;
+                }
               }
             }
             if (need_norm_bulk_pass) {
-              const Eigen::MatrixXd Xsz = z_scale(Xs);
-              if (want_rhat) {
-                rhat_bulk = rhat_basic(Xsz);
-              }
-              if (want_ess_bulk) {
-                ess_bulk_out[v] = ess_basic(Xsz, fft);
+              const Eigen::MatrixXd Xsz = z_scale(Xs, zsc);
+              if (want_rhat && want_ess_bulk) {
+                // Paired on the same matrix: one degeneracy check and one
+                // chain-means pass serve both stats.
+                if (!is_degenerate(Xsz)) {
+                  const Eigen::VectorXd cm = Xsz.colwise().mean();
+                  rhat_bulk = rhat_basic(Xsz, &cm);
+                  ess_bulk_out[v] = ess_basic(Xsz, &cm, fft, fft_re, fft_freq);
+                }
+              } else {
+                if (want_rhat) {
+                  rhat_bulk = rhat_basic(Xsz);
+                }
+                if (want_ess_bulk) {
+                  ess_bulk_out[v] =
+                      ess_basic(Xsz, nullptr, fft, fft_re, fft_freq);
+                }
               }
             }
           }
@@ -421,9 +668,10 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           }
 
           double rhat_tail = NA_REAL;
-          if (want_rhat) {
+          if (want_rhat && !x_degenerate) {
             const Eigen::MatrixXd Xfsz =
-                z_scale(split_chains((X.array() - median_val).abs().matrix()));
+                z_scale(split_chains((X.array() - median_val).abs().matrix()),
+                        zsc);
             rhat_tail = rhat_basic(Xfsz);
             rhat_out[v] = na_max(rhat_bulk, rhat_tail);
           }
@@ -431,33 +679,36 @@ Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
           if (want_ess_tail) {
             double ess_q5 = NA_REAL;
             double ess_q95 = NA_REAL;
-            if (!is_degenerate(X)) {
+            if (!x_degenerate) {
               ess_q5 = ess_basic(
                   split_chains((X.array() <= q5_val).cast<double>().matrix()),
-                  fft);
+                  nullptr, fft, fft_re, fft_freq);
               ess_q95 = ess_basic(
                   split_chains((X.array() <= q95_val).cast<double>().matrix()),
-                  fft);
+                  nullptr, fft, fft_re, fft_freq);
             }
             ess_tail_out[v] = na_min(ess_q5, ess_q95);
           }
 
-          // ess_sd(x) = ess of the squared centered draws (unnormalised,
-          // split); mcse_sd reuses that exact ESS as its own denominator, so
-          // both are gated on the same underlying value.
+          // ess_sd = ESS of squared centered draws; mcse_sd reuses it.
           double ess_sd_val = NA_REAL;
-          if (need_ess_sd_val) {
-            const Eigen::MatrixXd centered_sq =
-                (X.array() - mean_val).square().matrix();
-            ess_sd_val = ess_basic(split_chains(centered_sq), fft);
+          if (need_ess_sd_val && !x_degenerate) {
+            // Keep the squared-centred values as an expression; split_chains
+            // materializes the two halves directly into its output.
+            ess_sd_val = ess_basic(
+                split_chains((X.array() - mean_val).square().matrix()), nullptr,
+                fft, fft_re, fft_freq);
             if (want_ess_sd) {
               ess_sd_out[v] = ess_sd_val;
             }
           }
           if (want_mcse_sd) {
-            const auto centered = (X.array() - mean_val);
-            const double e_var = centered.square().mean();
-            const double e_var4 = centered.square().square().mean();
+            // ss (sum of squared centred draws) was already computed in the
+            // sd/var block; e_var = ss / n reuses it instead of passing over
+            // X again.
+            const double e_var = ss / n;
+            const double e_var4 =
+                (X.array() - mean_val).square().square().mean();
             const double var_of_var = (e_var4 - e_var * e_var) / ess_sd_val;
             const double var_of_sd = var_of_var / e_var / 4.0;
             mcse_sd_out[v] = std::sqrt(var_of_sd);

@@ -1,6 +1,3 @@
-# Shared helpers for comparing posteriorcpp::summarise_draws() against
-# posterior::summarise_draws() across many draws shapes and stat subsets.
-
 make_draws <- function(niter, nchains, nvars, seed = NULL, fun = stats::rnorm) {
   if (!is.null(seed)) set.seed(seed)
   posterior::as_draws_array(
@@ -10,17 +7,9 @@ make_draws <- function(niter, nchains, nvars, seed = NULL, fun = stats::rnorm) {
 
 all_stats <- c("mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail")
 
-# Compares posteriorcpp::summarise_draws(x, stats) against posterior's default
-# (single-core) summary, column by column. Tolerance is 1e-4 rather than
-# something tighter because posteriorcpp's real-input FFT and posterior's
-# complex-to-complex FFT accumulate floating point error differently; for
-# almost all variables this differs at the 1e-10-1e-12 level, but the
-# rhat/ess rho-truncation recursion (Geyer's initial monotone sequence) has
-# discrete branch conditions, and on rare variables sitting right at a
-# branch boundary that FFT-level noise can flip a truncation decision,
-# producing a "different but still numerically valid" result on the order of
-# 1e-5. 1e-4 comfortably absorbs that while remaining far tighter than any
-# genuine correctness bug would produce.
+# Compares posteriorcpp against posterior's default summary, column by column.
+# Tolerance 1e-4 absorbs FFT-level noise that can flip a discrete rho-truncation
+# branch on rare variables, producing a "different but valid" result ~1e-5.
 expect_matches_posterior <- function(x, stats = NULL, tolerance = 1e-4) {
   a <- if (is.null(stats)) {
     posteriorcpp::summarise_draws(x)

@@ -1,13 +1,14 @@
 Package: posteriorcpp
-Title: Fast C++ Implementations of Posterior Draws Summaries
+Title: Fast C++ Implementations of Bayesian Summary Statistics
 Version: 0.0.0.9000
 Authors@R:
-    person("First", "Last", , "first.last@example.com", role = c("aut", "cre"))
+    person(given = c("Andrew", "R."), family = "Johnson", role = c("aut", "cre"),
+            email = "andrew.johnson@arjohnsonau.com",
+            comment = c(ORCID = "0000-0001-7000-8065"))
 Description: Provides C++/RcppEigen implementations of summary and
     convergence diagnostics for posterior draws, matching the 'posterior'
     package but optimised for speed.
-License: `use_mit_license()`, `use_gpl3_license()` or friends to pick a
-    license
+License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 LinkingTo:

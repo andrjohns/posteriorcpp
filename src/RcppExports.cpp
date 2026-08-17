@@ -12,14 +12,14 @@ Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
 // summarise_draws_cpp
-Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws, Rcpp::LogicalVector want);
-RcppExport SEXP _posteriorcpp_summarise_draws_cpp(SEXP drawsSEXP, SEXP wantSEXP) {
+Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws, Rcpp::CharacterVector stats);
+RcppExport SEXP _posteriorcpp_summarise_draws_cpp(SEXP drawsSEXP, SEXP statsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::NumericVector >::type draws(drawsSEXP);
-    Rcpp::traits::input_parameter< Rcpp::LogicalVector >::type want(wantSEXP);
-    rcpp_result_gen = Rcpp::wrap(summarise_draws_cpp(draws, want));
+    Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type stats(statsSEXP);
+    rcpp_result_gen = Rcpp::wrap(summarise_draws_cpp(draws, stats));
     return rcpp_result_gen;
 END_RCPP
 }

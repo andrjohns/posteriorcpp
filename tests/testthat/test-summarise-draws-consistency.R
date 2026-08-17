@@ -1,7 +1,4 @@
-# Numerical consistency with posterior::summarise_draws() across a broad
-# sweep of draws shapes and underlying distributions.
-
-test_that("matches posterior across a sweep of niter/nchains/nvars shapes", {
+test_that("matches posterior across a broad sweep of draws shapes and distributions", {
   shapes <- list(
     c(niter = 100,  nchains = 2,  nvars = 1),
     c(niter = 100,  nchains = 4,  nvars = 8),
@@ -47,17 +44,14 @@ test_that("matches posterior for autocorrelated (non-independent) draws", {
   nchains <- 4
   nvars <- 4
   raw <- array(rnorm(niter * nchains * nvars), dim = c(niter, nchains, nvars))
-  # cumulative-sum random walk per chain/variable induces strong
-  # autocorrelation, which is exactly what rhat/ess are meant to detect;
-  # apply(..., cumsum) over the (nchains, nvars) margins preserves the
-  # (niter, nchains, nvars) shape since cumsum returns a same-length vector
+  # cumsum per chain/variable induces autocorrelation for rhat/ess to detect.
   ac <- apply(raw, c(2, 3), cumsum)
   x <- posterior::as_draws_array(ac)
   expect_matches_posterior(x)
 })
 
 test_that("matches posterior for draws with very low effective sample size", {
-  # a slowly-mixing AR(1)-like chain: high autocorrelation -> low ESS, high rhat
+  # Slowly-mixing AR(1)-like chain: high autocorrelation -> low ESS, high rhat.
   set.seed(7)
   niter <- 1000
   nchains <- 4
@@ -82,7 +76,7 @@ test_that("matches posterior when chains have different means (poor mixing / hig
   nchains <- 4
   nvars <- 3
   arr <- array(rnorm(niter * nchains * nvars), dim = c(niter, nchains, nvars))
-  # shift each chain's mean so rhat should be large
+  # Shift each chain's mean so rhat should be large.
   for (c in seq_len(nchains)) arr[, c, ] <- arr[, c, ] + c * 5
   x <- posterior::as_draws_array(arr)
   expect_matches_posterior(x)

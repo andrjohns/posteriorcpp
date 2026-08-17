@@ -1,16 +1,8 @@
-# Tests for the opt-in stats added beyond posterior::summarise_draws()'s own
-# default set: "var", "rhat_basic", "ess_basic". Reference values come
-# directly from the matching posterior functions, not from
-# posterior::summarise_draws() itself, since these aren't in its default
-# funs list.
+# Tests for opt-in stats beyond posterior's default set: "var", "rhat_basic",
+# "ess_basic". Reference values come from the matching posterior functions.
 #
-# Note on "var": summarise_draws()/sd() pass each variable through as a
-# flattened (niter x nchains) scalar (sd() explicitly flattens non-vector
-# input), whereas posterior::variance()/var() called directly on a bare
-# matrix instead give per-chain variances or a covariance matrix. The
-# correct scalar reference is therefore stats::var(as.vector(m)), matching
-# how sd() (and thus posteriorcpp's existing "sd" column) already treats the
-# matrix.
+# "var" reference: summarise_draws()/sd() flatten each variable to a scalar,
+# so the correct reference is stats::var(as.vector(m)), not posterior::var().
 
 reference_value <- function(stat, m) {
   switch(stat,
@@ -58,8 +50,7 @@ test_that("ess_basic matches posterior::ess_basic()", {
 })
 
 test_that("rhat_basic differs from rank-normalised rhat on skewed data", {
-  # rhat_basic omits the rank-normalisation step, so on a distribution with
-  # heavy skew the two diagnostics need not agree even on well-mixed chains.
+  # rhat_basic omits rank-normalisation, so the two need not agree on skew.
   x <- make_draws(1000, 4, 5, seed = 5, fun = function(n) stats::rexp(n, rate = 0.5))
   out <- posteriorcpp::summarise_draws(x, stats = c("rhat", "rhat_basic"))
   expect_false(isTRUE(all.equal(out$rhat, out$rhat_basic)))

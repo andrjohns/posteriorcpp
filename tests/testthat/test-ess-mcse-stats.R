@@ -1,7 +1,5 @@
-# Tests for the second opt-in batch: "ess_mean", "ess_sd", "mcse_mean",
-# "mcse_sd". Reference values come directly from the matching posterior
-# functions (posterior::ess_mean() etc.), not from posterior::summarise_draws()
-# itself, since these aren't in its default funs list.
+# Tests for "ess_mean", "ess_sd", "mcse_mean", "mcse_sd". Reference values
+# come from the matching posterior functions, not summarise_draws().
 
 reference_value2 <- function(stat, m) {
   switch(stat,

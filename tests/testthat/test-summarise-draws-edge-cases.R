@@ -46,7 +46,7 @@ test_that("single-chain draws (nchains = 1) are handled consistently", {
 })
 
 test_that("very short chains (niter = 1, 3) do not error and match posterior", {
-  # niter = 2 is deliberately excluded here — see the dedicated test below.
+  # niter = 2 is excluded here — see the dedicated test below.
   for (niter in c(1, 3)) {
     x <- make_draws(niter, 4, 3, seed = niter + 10)
     expect_no_error(out <- posteriorcpp::summarise_draws(x))
@@ -56,17 +56,9 @@ test_that("very short chains (niter = 1, 3) do not error and match posterior", {
 })
 
 test_that("niter = 2 does not error (known divergence from posterior's ess_tail)", {
-  # posterior's R-level .split_chains() indexes a single-row half with
-  # `x[1, ]`, which R's default `drop = TRUE` collapses to a plain vector;
-  # cbind()-ing the two halves then produces an (nchains x 2) matrix instead
-  # of the intended (1 x 2*nchains) one. That accidental transpose gives
-  # ess_tail's indicator-matrix ESS enough rows to escape the niter<3 guard,
-  # so posterior can return a real ess_tail value here instead of NA.
-  # posteriorcpp builds the split explicitly and always produces the
-  # mathematically-intended (1 x 2*nchains) shape, so it correctly returns
-  # NA for every stat that depends on a single-row split at niter = 2. This
-  # is a quirk of posterior's edge-case handling, not a bug to replicate —
-  # niter = 2 chains carry no meaningful convergence signal either way.
+  # posterior's .split_chains() drops a single-row half to a vector, so its
+  # ess_tail can escape the niter<3 guard; posteriorcpp's explicit split
+  # returns NA. A quirk of posterior, not a bug to replicate.
   x <- make_draws(2, 4, 3, seed = 12)
   expect_no_error(out <- posteriorcpp::summarise_draws(x))
   expect_equal(nrow(out), 3)
