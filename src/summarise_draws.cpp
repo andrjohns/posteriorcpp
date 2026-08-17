@@ -372,32 +372,19 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
       need_z_scale ? qnorm_lut(split_chains_size(niter, nchains)) : nullptr;
 
   // auto_partitioner splits to one variable per chunk, so the body below runs
-  // per variable, not per thread; scratch must live out here to be reused.
-  struct Scratch {
-    std::vector<double> sorted, abs_dev;
-    ZScratch zsc;
-    bool init = false;
-  };
-  tbb::enumerable_thread_specific<Scratch> scratch;
-
+  // per variable, not per thread.
   tbb::parallel_for(
       tbb::blocked_range<int>(0, nvars),
       [&](const tbb::blocked_range<int>& range) {
-        Scratch& sc = scratch.local();
-        if (!sc.init) {
+        for (int v = range.begin(); v != range.end(); ++v) {
+          std::vector<double> sorted, abs_dev;
           if (need_sorted) {
-            sc.sorted.resize(n);
+            sorted.resize(n);
           }
           if (want_mad) {
-            sc.abs_dev.resize(n);
+            abs_dev.resize(n);
           }
-          sc.init = true;
-        }
-        std::vector<double>& sorted = sc.sorted;
-        std::vector<double>& abs_dev = sc.abs_dev;
-        ZScratch& zsc = sc.zsc;
-
-        for (int v = range.begin(); v != range.end(); ++v) {
+          ZScratch zsc;
           const Eigen::Map<const Eigen::MatrixXd> X(
               ptr + static_cast<std::size_t>(v) * n, niter, nchains);
 
