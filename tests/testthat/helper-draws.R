@@ -7,9 +7,8 @@ make_draws <- function(niter, nchains, nvars, seed = NULL, fun = stats::rnorm) {
 
 all_stats <- c("mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail")
 
-# Compares posteriorcpp against posterior's default summary, column by column.
-# Tolerance 1e-4 absorbs FFT-level noise that can flip a discrete rho-truncation
-# branch on rare variables, producing a "different but valid" result ~1e-5.
+# Tolerance 1e-4 absorbs FFT noise that can flip a discrete rho-truncation
+# branch on rare variables, giving a different but valid result around 1e-5.
 expect_matches_posterior <- function(x, stats = NULL, tolerance = 1e-4) {
   a <- if (is.null(stats)) {
     posteriorcpp::summarise_draws(x)

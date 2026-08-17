@@ -1,5 +1,5 @@
-# Tests for "ess_mean", "ess_sd", "mcse_mean", "mcse_sd". Reference values
-# come from the matching posterior functions, not summarise_draws().
+# Reference values come from the matching posterior functions directly, not
+# from posterior::summarise_draws().
 
 reference_value2 <- function(stat, m) {
   switch(stat,

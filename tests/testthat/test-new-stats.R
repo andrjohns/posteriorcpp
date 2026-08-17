@@ -1,8 +1,5 @@
-# Tests for opt-in stats beyond posterior's default set: "var", "rhat_basic",
-# "ess_basic". Reference values come from the matching posterior functions.
-#
-# "var" reference: summarise_draws()/sd() flatten each variable to a scalar,
-# so the correct reference is stats::var(as.vector(m)), not posterior::var().
+# summarise_draws()/sd() flatten each variable to a scalar, so the "var"
+# reference is stats::var(as.vector(m)), not posterior::var().
 
 reference_value <- function(stat, m) {
   switch(stat,

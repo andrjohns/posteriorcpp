@@ -56,9 +56,8 @@ test_that("very short chains (niter = 1, 3) do not error and match posterior", {
 })
 
 test_that("niter = 2 does not error (known divergence from posterior's ess_tail)", {
-  # posterior's .split_chains() drops a single-row half to a vector, so its
-  # ess_tail can escape the niter<3 guard; posteriorcpp's explicit split
-  # returns NA. A quirk of posterior, not a bug to replicate.
+  # posterior's .split_chains() drops a single-row half to a vector, letting
+  # its ess_tail escape the niter<3 guard. A quirk, not a bug to replicate.
   x <- make_draws(2, 4, 3, seed = 12)
   expect_no_error(out <- posteriorcpp::summarise_draws(x))
   expect_equal(nrow(out), 3)
