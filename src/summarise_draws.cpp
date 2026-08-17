@@ -111,9 +111,11 @@ static std::shared_ptr<const std::vector<double>> qnorm_lut(int S) {
   constexpr double c = 3.0 / 8.0;
   const double denom = S - 2 * c + 1;
   auto lut = std::make_shared<std::vector<double>>(S);
-  for (int k = 0; k < S; k++) {
-    (*lut)[k] = R::qnorm((k + 1 - c) / denom, 0.0, 1.0, 1, 0);
-  }
+  Eigen::Map<Eigen::VectorXd>(lut->data(), S) =
+      Eigen::VectorXd::LinSpaced(S, 1.0, static_cast<double>(S)).unaryExpr(
+          [&](double k) {
+            return R::qnorm((k - c) / denom, 0.0, 1.0, 1, 0);
+          });
   std::lock_guard<std::mutex> lock(g_qnorm_lut_mutex);
   return g_qnorm_lut_cache.emplace(S, std::move(lut)).first->second;
 }
@@ -127,12 +129,16 @@ static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
   // Untied ranks are exactly 1..S, served by the shared lut. Tied ranks
   // average to half-integers and fall through to the direct call.
   Eigen::MatrixXd z(x.rows(), x.cols());
-  for (int k = 0; k < S; k++) {
-    const double r = sc.rank[k];
-    const int ir = static_cast<int>(r);
-    z.data()[k] =
-        (r == ir) ? lut[ir - 1] : R::qnorm((r - c) / denom, 0.0, 1.0, 1, 0);
-  }
+  const Eigen::Map<const Eigen::VectorXd> rank(sc.rank.data(), S);
+  const Eigen::ArrayXi ir = rank.array().floor().cast<int>();
+  Eigen::Map<Eigen::VectorXd>(z.data(), S) =
+      (rank.array() == ir.cast<double>())
+          .select(Eigen::Map<const Eigen::ArrayXd>(lut.data(), S)(ir - 1),
+                  ((rank.array() - c) / denom)
+                      .unaryExpr([&](double p) {
+                        return R::qnorm(p, 0.0, 1.0, 1, 0);
+                      }))
+          .matrix();
   return z;
 }
 
@@ -158,9 +164,10 @@ static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
   const pocketfft::stride_t cstride{sizeof(std::complex<double>)};
   pocketfft::r2c<double>(shape, stride, cstride, 0, true, real.data(),
                          spec.data(), 1.0);
-  for (auto& c : spec) {
-    c = c * std::conj(c);
-  }
+  const Eigen::Map<const Eigen::ArrayXcd> S(spec.data(),
+                                            static_cast<int>(spec.size()));
+  Eigen::Map<Eigen::ArrayXcd>(spec.data(), static_cast<int>(spec.size())) =
+      S.abs2();
   pocketfft::c2r<double>(shape, cstride, stride, 0, false, spec.data(),
                          real.data(), 1.0);
   out.head(N) = Eigen::Map<const Eigen::VectorXd>(real.data(), N);
