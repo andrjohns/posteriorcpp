@@ -11,21 +11,21 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
-// summarise_draws_cpp
-Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws, Rcpp::CharacterVector stats);
-RcppExport SEXP _posteriorcpp_summarise_draws_cpp(SEXP drawsSEXP, SEXP statsSEXP) {
+// summarise_draws_cpp_
+Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws, Rcpp::CharacterVector stats);
+RcppExport SEXP _posteriorcpp_summarise_draws_cpp_(SEXP drawsSEXP, SEXP statsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< Rcpp::NumericVector >::type draws(drawsSEXP);
     Rcpp::traits::input_parameter< Rcpp::CharacterVector >::type stats(statsSEXP);
-    rcpp_result_gen = Rcpp::wrap(summarise_draws_cpp(draws, stats));
+    rcpp_result_gen = Rcpp::wrap(summarise_draws_cpp_(draws, stats));
     return rcpp_result_gen;
 END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
-    {"_posteriorcpp_summarise_draws_cpp", (DL_FUNC) &_posteriorcpp_summarise_draws_cpp, 2},
+    {"_posteriorcpp_summarise_draws_cpp_", (DL_FUNC) &_posteriorcpp_summarise_draws_cpp_, 2},
     {NULL, NULL, 0}
 };
 

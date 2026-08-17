@@ -355,7 +355,7 @@ static bool has_stat(const Rcpp::CharacterVector& stats,
 
 // Shared work is computed once; unrequested stats skip computation entirely.
 // [[Rcpp::export]]
-Rcpp::List summarise_draws_cpp(Rcpp::NumericVector draws,
+Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
                                Rcpp::CharacterVector stats) {
   const Rcpp::IntegerVector dim = draws.attr("dim");
   const int niter = dim[0];

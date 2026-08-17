@@ -25,7 +25,7 @@
 #' @return A [tibble][tibble::tibble] with one row per variable and one
 #'   column per requested statistic.
 #' @export
-summarise_draws <- function(x, stats = .posteriorcpp_default_stats) {
+summarise_draws_cpp <- function(x, stats = .posteriorcpp_default_stats) {
   if (length(stats) == 0L) {
     stop("`stats` must specify at least one statistic to compute.")
   }
@@ -52,7 +52,7 @@ summarise_draws <- function(x, stats = .posteriorcpp_default_stats) {
     ))
   }
 
-  out <- summarise_draws_cpp(unclass(x), stats)
+  out <- summarise_draws_cpp_(unclass(x), stats)
   out$variable <- vars
 
   structure(
@@ -61,7 +61,3 @@ summarise_draws <- function(x, stats = .posteriorcpp_default_stats) {
     class = c("tbl_df", "tbl", "data.frame")
   )
 }
-
-#' @rdname summarise_draws
-#' @export
-summarize_draws <- summarise_draws
