@@ -8,8 +8,6 @@
 #include <algorithm>
 #include <cmath>
 #include <complex>
-#include <cstdint>
-#include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -46,35 +44,6 @@ static double quantile7(const std::vector<double>& sorted, double p) {
   return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
 }
 
-// Places the k-th and (k+1)-th order statistics; everything else is left
-// merely partitioned around them, which quantiles7_select relies on.
-static inline void order_pair(double* first, double* last, int k) {
-  std::nth_element(first, first + k, last);
-  std::nth_element(first + k + 1, first + k + 1, last);
-}
-
-// Type-7 quantiles at p = 0.05/0.5/0.95 by nested selection, not a full sort.
-// Destroys buf; requires n >= 4, below which the rank bounds below break.
-static void quantiles7_select(std::vector<double>& buf, double& q05,
-                              double& q50, double& q95) {
-  const int n = static_cast<int>(buf.size());
-  double* const b = buf.data();
-  const double h5 = (n - 1) * 0.05, h50 = (n - 1) * 0.50, h95 = (n - 1) * 0.95;
-  const int lo5 = static_cast<int>(std::floor(h5));
-  const int lo50 = static_cast<int>(std::floor(h50));
-  const int lo95 = static_cast<int>(std::floor(h95));
-  // For n >= 4, ceil(h5) <= lo50 and floor(h95) >= lo50 + 1, so neither side
-  // quantile ever needs an element from the other half.
-  order_pair(b, b + n, lo50);
-  q50 = b[lo50] + (h50 - lo50) * (b[lo50 + 1] - b[lo50]);
-  order_pair(b, b + lo50 + 1, lo5);  // ranks 0..lo50 live here
-  q05 = b[lo5] + (h5 - lo5) * (b[lo5 + 1] - b[lo5]);
-  double* const u = b + lo50 + 1;  // ranks lo50+1..n-1 live here
-  order_pair(u, b + n, lo95 - (lo50 + 1));
-  const int r95 = lo95 - (lo50 + 1);
-  q95 = u[r95] + (h95 - lo95) * (u[r95 + 1] - u[r95]);
-}
-
 template <typename Derived>
 static Eigen::MatrixXd split_chains(const Eigen::MatrixBase<Derived>& x) {
   const int niter = x.rows();
@@ -95,98 +64,31 @@ static inline int split_chains_size(int niter, int nchains) {
 }
 
 struct ZScratch {
-  std::vector<std::uint64_t> ka, kb;  // sort keys, ping-pong buffers
-  std::vector<int> ia, ib;            // permutation, ping-pong buffers
   std::vector<double> rank;
-  std::vector<std::pair<double, int>> pbuf;  // comparison-sort fallback
+  std::vector<std::pair<double, int>> pbuf;  // sort scratch
 };
-
-// Order-preserving double -> uint64: unsigned key order matches < on non-NaN
-// doubles, so ranks can come from an integer radix sort.
-static inline std::uint64_t sortable_key(double d) {
-  std::uint64_t u;
-  std::memcpy(&u, &d, sizeof(u));
-  return (u & 0x8000000000000000ULL) ? ~u : (u | 0x8000000000000000ULL);
-}
-
-// Measured crossover on Apple silicon is near S = 1400 (1280: 0.92x, 1536:
-// 1.15x, 4096: 3.1x); below it the comparison sort wins.
-static constexpr int RADIX_MIN = 1536;
 
 // 1-based ranks with ties averaged, written to sc.rank in input order.
 static void average_ranks(const double* data, int S, ZScratch& sc) {
-  if (S < RADIX_MIN) {
-    sc.pbuf.resize(S);
-    for (int i = 0; i < S; i++) {
-      sc.pbuf[i] = {data[i], i};
-    }
-    std::sort(
-        sc.pbuf.begin(), sc.pbuf.end(),
-        [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
-          return a.first < b.first;
-        });
-    sc.rank.resize(S);
-    int i = 0;
-    while (i < S) {
-      int j = i;
-      while (j + 1 < S && sc.pbuf[j + 1].first == sc.pbuf[i].first) {
-        j++;
-      }
-      const double avg_rank = (i + j) / 2.0 + 1.0;
-      for (int k = i; k <= j; k++) {
-        sc.rank[sc.pbuf[k].second] = avg_rank;
-      }
-      i = j + 1;
-    }
-    return;
-  }
-  sc.ka.resize(S);
-  sc.kb.resize(S);
-  sc.ia.resize(S);
-  sc.ib.resize(S);
+  sc.pbuf.resize(S);
   for (int i = 0; i < S; i++) {
-    sc.ka[i] = sortable_key(data[i]);
-    sc.ia[i] = i;
+    sc.pbuf[i] = {data[i], i};
   }
-  // One pass builds all eight byte histograms; a digit that is constant across
-  // the array cannot reorder anything, so that pass is skipped.
-  int hist[8][256];
-  std::memset(hist, 0, sizeof(hist));
-  for (int i = 0; i < S; i++) {
-    const std::uint64_t k = sc.ka[i];
-    for (int p = 0; p < 8; p++) {
-      hist[p][(k >> (8 * p)) & 0xFF]++;
-    }
-  }
-  for (int p = 0; p < 8; p++) {
-    const int sh = 8 * p;
-    if (hist[p][(sc.ka[0] >> sh) & 0xFF] == S) {
-      continue;
-    }
-    int off[256], sum = 0;
-    for (int d = 0; d < 256; d++) {
-      off[d] = sum;
-      sum += hist[p][d];
-    }
-    for (int i = 0; i < S; i++) {
-      const int o = off[(sc.ka[i] >> sh) & 0xFF]++;
-      sc.kb[o] = sc.ka[i];
-      sc.ib[o] = sc.ia[i];
-    }
-    sc.ka.swap(sc.kb);
-    sc.ia.swap(sc.ib);
-  }
-  // Keys compare equal exactly when the doubles did, so ties scan on keys.
+  std::sort(
+      sc.pbuf.begin(), sc.pbuf.end(),
+      [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
+        return a.first < b.first;
+      });
   sc.rank.resize(S);
   int i = 0;
   while (i < S) {
     int j = i;
-    while (j + 1 < S && sc.ka[j + 1] == sc.ka[i]) {
+    while (j + 1 < S && sc.pbuf[j + 1].first == sc.pbuf[i].first) {
       j++;
     }
     const double avg_rank = (i + j) / 2.0 + 1.0;
     for (int k = i; k <= j; k++) {
-      sc.rank[sc.ia[k]] = avg_rank;
+      sc.rank[sc.pbuf[k].second] = avg_rank;
     }
     i = j + 1;
   }
@@ -527,17 +429,10 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           double median_val = NA_REAL, q5_val = NA_REAL, q95_val = NA_REAL;
           if (need_sorted) {
             std::copy(X.data(), X.data() + n, sorted.begin());
-            if (want_mad || n < 4) {
-              // The mad merge below needs total order; tiny inputs sort in a
-              // handful of compares anyway.
-              std::sort(sorted.begin(), sorted.end());
-              median_val = quantile7(sorted, 0.5);
-              q5_val = quantile7(sorted, 0.05);
-              q95_val = quantile7(sorted, 0.95);
-            } else {
-              // Same values as quantile7() on a fully sorted buffer.
-              quantiles7_select(sorted, q5_val, median_val, q95_val);
-            }
+            std::sort(sorted.begin(), sorted.end());
+            median_val = quantile7(sorted, 0.5);
+            q5_val = quantile7(sorted, 0.05);
+            q95_val = quantile7(sorted, 0.95);
             if (want_median) {
               median_out[v] = median_val;
             }
