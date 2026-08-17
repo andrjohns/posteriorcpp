@@ -4,7 +4,7 @@ test_that("NA/NaN draws for a variable propagate as NA across all stats for that
   arr[5, 2, 2] <- NaN
   x <- posterior::as_draws_array(arr)
 
-  out <- posteriorcpp::summarise_draws(x)
+  out <- posteriorcpp::summarise_draws_cpp(x)
   expect_true(all(is.na(out[out$variable == "...2", all_stats])))
   expect_true(all(!is.na(out[out$variable == "...1", all_stats])))
   expect_true(all(!is.na(out[out$variable == "...3", all_stats])))
@@ -27,7 +27,7 @@ test_that("a constant (zero-variance) variable yields NA convergence diagnostics
   arr[, , 1] <- 7 # constant across all draws
   x <- posterior::as_draws_array(arr)
 
-  out <- posteriorcpp::summarise_draws(x)
+  out <- posteriorcpp::summarise_draws_cpp(x)
   const_row <- out[out$variable == "...1", ]
   expect_equal(const_row$mean, 7)
   expect_equal(const_row$median, 7)
@@ -49,7 +49,7 @@ test_that("very short chains (niter = 1, 3) do not error and match posterior", {
   # niter = 2 is excluded here — see the dedicated test below.
   for (niter in c(1, 3)) {
     x <- make_draws(niter, 4, 3, seed = niter + 10)
-    expect_no_error(out <- posteriorcpp::summarise_draws(x))
+    expect_no_error(out <- posteriorcpp::summarise_draws_cpp(x))
     expect_equal(nrow(out), 3)
     expect_matches_posterior(x)
   }
@@ -59,7 +59,7 @@ test_that("niter = 2 does not error (known divergence from posterior's ess_tail)
   # posterior's .split_chains() drops a single-row half to a vector, letting
   # its ess_tail escape the niter<3 guard. A quirk, not a bug to replicate.
   x <- make_draws(2, 4, 3, seed = 12)
-  expect_no_error(out <- posteriorcpp::summarise_draws(x))
+  expect_no_error(out <- posteriorcpp::summarise_draws_cpp(x))
   expect_equal(nrow(out), 3)
   expect_true(all(is.na(out$rhat)))
   expect_true(all(is.na(out$ess_bulk)))
@@ -68,7 +68,7 @@ test_that("niter = 2 does not error (known divergence from posterior's ess_tail)
 
 test_that("a single draw total (niter = 1, nchains = 1) does not error", {
   x <- make_draws(1, 1, 2, seed = 11)
-  expect_no_error(out <- posteriorcpp::summarise_draws(x))
+  expect_no_error(out <- posteriorcpp::summarise_draws_cpp(x))
   expect_equal(nrow(out), 2)
 })
 

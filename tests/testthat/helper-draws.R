@@ -11,9 +11,9 @@ all_stats <- c("mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "
 # branch on rare variables, giving a different but valid result around 1e-5.
 expect_matches_posterior <- function(x, stats = NULL, tolerance = 1e-4) {
   a <- if (is.null(stats)) {
-    posteriorcpp::summarise_draws(x)
+    posteriorcpp::summarise_draws_cpp(x)
   } else {
-    posteriorcpp::summarise_draws(x, stats = stats)
+    posteriorcpp::summarise_draws_cpp(x, stats = stats)
   }
   b <- posterior::summarise_draws(x)
 

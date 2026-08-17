@@ -11,6 +11,9 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
 #include <unsupported/Eigen/FFT>
 #include <vector>
 
@@ -79,13 +82,17 @@ static Eigen::MatrixXd split_chains(const Eigen::MatrixBase<Derived>& x) {
   return out;
 }
 
+// split_chains(X)'s element count -- odd niter drops one row, so this is
+// niter*nchains only when niter is even.
+static inline int split_chains_size(int niter, int nchains) {
+  return (niter / 2 == 0 ? niter : 2 * (niter / 2)) * nchains;
+}
+
 struct ZScratch {
   std::vector<std::uint64_t> ka, kb;  // sort keys, ping-pong buffers
   std::vector<int> ia, ib;            // permutation, ping-pong buffers
   std::vector<double> rank;
   std::vector<std::pair<double, int>> pbuf;  // comparison-sort fallback
-  std::vector<double> lut;                   // qnorm at integer ranks 1..S
-  int lut_S = -1;
 };
 
 // Order-preserving double -> uint64: unsigned key order matches < on non-NaN
@@ -177,26 +184,43 @@ static void average_ranks(const double* data, int S, ZScratch& sc) {
   }
 }
 
+// S depends only on (niter, nchains), so it's identical across every
+// variable, thread, and repeat call with that shape -- cache it globally.
+static std::mutex g_qnorm_lut_mutex;
+static std::unordered_map<int, std::shared_ptr<const std::vector<double>>>
+    g_qnorm_lut_cache;
+
+static std::shared_ptr<const std::vector<double>> qnorm_lut(int S) {
+  {
+    std::lock_guard<std::mutex> lock(g_qnorm_lut_mutex);
+    const auto it = g_qnorm_lut_cache.find(S);
+    if (it != g_qnorm_lut_cache.end()) {
+      return it->second;
+    }
+  }
+  constexpr double c = 3.0 / 8.0;
+  const double denom = S - 2 * c + 1;
+  auto lut = std::make_shared<std::vector<double>>(S);
+  for (int k = 0; k < S; k++) {
+    (*lut)[k] = R::qnorm((k + 1 - c) / denom, 0.0, 1.0, 1, 0);
+  }
+  std::lock_guard<std::mutex> lock(g_qnorm_lut_mutex);
+  return g_qnorm_lut_cache.emplace(S, std::move(lut)).first->second;
+}
+
 static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
-                               ZScratch& sc) {
+                               ZScratch& sc, const std::vector<double>& lut) {
   const int S = x.size();
   average_ranks(x.data(), S, sc);
   constexpr double c = 3.0 / 8.0;
   const double denom = S - 2 * c + 1;
-  // Untied ranks are exactly 1..S, so qnorm has only S distinct arguments.
-  // Tied ranks average to half-integers and fall through to the direct call.
-  if (sc.lut_S != S) {
-    sc.lut.resize(S);
-    for (int k = 0; k < S; k++) {
-      sc.lut[k] = R::qnorm((k + 1 - c) / denom, 0.0, 1.0, 1, 0);
-    }
-    sc.lut_S = S;
-  }
+  // Untied ranks are exactly 1..S, served by the shared lut. Tied ranks
+  // average to half-integers and fall through to the direct call.
   Eigen::MatrixXd z(x.rows(), x.cols());
   for (int k = 0; k < S; k++) {
     const double r = sc.rank[k];
     const int ir = static_cast<int>(r);
-    z.data()[k] = (r == ir) ? sc.lut[ir - 1]
+    z.data()[k] = (r == ir) ? lut[ir - 1]
                             : R::qnorm((r - c) / denom, 0.0, 1.0, 1, 0);
   }
   return z;
@@ -450,6 +474,11 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
 
   const int n = niter * nchains;
 
+  // z_scale() is the only qnorm_lut() consumer; skip building it otherwise.
+  const bool need_z_scale = want_rhat || want_ess_bulk;
+  const std::shared_ptr<const std::vector<double>> shared_qnorm_lut =
+      need_z_scale ? qnorm_lut(split_chains_size(niter, nchains)) : nullptr;
+
   // auto_partitioner splits to one variable per chunk, so the body below runs
   // per variable, not per thread; scratch must live out here to be reused.
   struct Scratch {
@@ -599,7 +628,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
               }
             }
             if (need_norm_bulk_pass) {
-              const Eigen::MatrixXd Xsz = z_scale(Xs, zsc);
+              const Eigen::MatrixXd Xsz = z_scale(Xs, zsc, *shared_qnorm_lut);
               if (want_rhat && want_ess_bulk) {
                 // Paired: one degeneracy check and one chain-means pass
                 // serve both stats.
@@ -627,7 +656,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           if (want_rhat && !x_degenerate) {
             const Eigen::MatrixXd Xfsz =
                 z_scale(split_chains((X.array() - median_val).abs().matrix()),
-                        zsc);
+                        zsc, *shared_qnorm_lut);
             rhat_tail = rhat_basic(Xfsz);
             rhat_out[v] = na_max(rhat_bulk, rhat_tail);
           }
