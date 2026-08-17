@@ -2,7 +2,6 @@
 // [[Rcpp::depends(RcppParallel)]]
 #include <RcppEigen.h>
 #include <tbb/blocked_range.h>
-#include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
 
 #include <algorithm>
@@ -63,35 +62,31 @@ static inline int split_chains_size(int niter, int nchains) {
   return (niter / 2 == 0 ? niter : 2 * (niter / 2)) * nchains;
 }
 
-struct ZScratch {
-  std::vector<double> rank;
-  std::vector<std::pair<double, int>> pbuf;  // sort scratch
-};
-
-// 1-based ranks with ties averaged, written to sc.rank in input order.
-static void average_ranks(const double* data, int S, ZScratch& sc) {
-  sc.pbuf.resize(S);
+// 1-based ranks with ties averaged, returned in input order.
+static std::vector<double> average_ranks(const double* data, int S) {
+  std::vector<std::pair<double, int>> pbuf(S);
   for (int i = 0; i < S; i++) {
-    sc.pbuf[i] = {data[i], i};
+    pbuf[i] = {data[i], i};
   }
   std::sort(
-      sc.pbuf.begin(), sc.pbuf.end(),
+      pbuf.begin(), pbuf.end(),
       [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
         return a.first < b.first;
       });
-  sc.rank.resize(S);
+  std::vector<double> rank(S);
   int i = 0;
   while (i < S) {
     int j = i;
-    while (j + 1 < S && sc.pbuf[j + 1].first == sc.pbuf[i].first) {
+    while (j + 1 < S && pbuf[j + 1].first == pbuf[i].first) {
       j++;
     }
     const double avg_rank = (i + j) / 2.0 + 1.0;
     for (int k = i; k <= j; k++) {
-      sc.rank[sc.pbuf[k].second] = avg_rank;
+      rank[pbuf[k].second] = avg_rank;
     }
     i = j + 1;
   }
+  return rank;
 }
 
 // S depends only on (niter, nchains), so it's identical across every
@@ -121,20 +116,20 @@ static std::shared_ptr<const std::vector<double>> qnorm_lut(int S) {
 }
 
 static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
-                               ZScratch& sc, const std::vector<double>& lut) {
+                               const std::vector<double>& lut) {
   const int S = x.size();
-  average_ranks(x.data(), S, sc);
+  const std::vector<double> rank = average_ranks(x.data(), S);
   constexpr double c = 3.0 / 8.0;
   const double denom = S - 2 * c + 1;
   // Untied ranks are exactly 1..S, served by the shared lut. Tied ranks
   // average to half-integers and fall through to the direct call.
   Eigen::MatrixXd z(x.rows(), x.cols());
-  const Eigen::Map<const Eigen::VectorXd> rank(sc.rank.data(), S);
-  const Eigen::ArrayXi ir = rank.array().floor().cast<int>();
+  const Eigen::Map<const Eigen::VectorXd> rank_v(rank.data(), S);
+  const Eigen::ArrayXi ir = rank_v.array().floor().cast<int>();
   Eigen::Map<Eigen::VectorXd>(z.data(), S) =
-      (rank.array() == ir.cast<double>())
+      (rank_v.array() == ir.cast<double>())
           .select(Eigen::Map<const Eigen::ArrayXd>(lut.data(), S)(ir - 1),
-                  ((rank.array() - c) / denom)
+                  ((rank_v.array() - c) / denom)
                       .unaryExpr([&](double p) {
                         return R::qnorm(p, 0.0, 1.0, 1, 0);
                       }))
@@ -384,7 +379,6 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           if (want_mad) {
             abs_dev.resize(n);
           }
-          ZScratch zsc;
           const Eigen::Map<const Eigen::MatrixXd> X(
               ptr + static_cast<std::size_t>(v) * n, niter, nchains);
 
@@ -492,7 +486,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
               }
             }
             if (need_norm_bulk_pass) {
-              const Eigen::MatrixXd Xsz = z_scale(Xs, zsc, *shared_qnorm_lut);
+              const Eigen::MatrixXd Xsz = z_scale(Xs, *shared_qnorm_lut);
               if (want_rhat && want_ess_bulk) {
                 // Paired: one degeneracy check and one chain-means pass
                 // serve both stats.
@@ -519,7 +513,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           if (want_rhat && !x_degenerate) {
             const Eigen::MatrixXd Xfsz =
                 z_scale(split_chains((X.array() - median_val).abs().matrix()),
-                        zsc, *shared_qnorm_lut);
+                        *shared_qnorm_lut);
             rhat_tail = rhat_basic(Xfsz);
             rhat_out[v] = na_max(rhat_bulk, rhat_tail);
           }
