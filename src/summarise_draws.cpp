@@ -237,28 +237,6 @@ static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
   return z;
 }
 
-// Next 5-smooth multiple of 4 >= n; keeps the FFT size composite-friendly.
-static int nextn(int n) {
-  for (int cand = n;; cand++) {
-    if (cand % 2 != 0) {
-      continue;
-    }
-    int m = cand;
-    while (m % 2 == 0) {
-      m /= 2;
-    }
-    while (m % 3 == 0) {
-      m /= 3;
-    }
-    while (m % 5 == 0) {
-      m /= 5;
-    }
-    if (m == 1) {
-      return cand;
-    }
-  }
-}
-
 using PocketPlan = pocketfft::detail::pocketfft_r<double>;
 
 // L is call-invariant like qnorm_lut's S above -- cache it globally too.
@@ -516,8 +494,14 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   // autocovariance() is the only pocketfft_plan() consumer; skip it otherwise.
   const bool need_fft =
       need_raw_ess || want_ess_bulk || want_ess_tail || need_ess_sd_val;
+  // The real FFT size is 2*N (zero-padded to 2N for the linear correlation);
+  // good_size_real rounds it up to the smallest 2/3/5-smooth size, which is
+  // what pocketfft factorises efficiently.
   const std::shared_ptr<const PocketPlan> shared_pocketfft_plan =
-      need_fft ? pocketfft_plan(2 * nextn(post_split_niter(niter))) : nullptr;
+      need_fft
+          ? pocketfft_plan(static_cast<int>(pocketfft::detail::util::good_size_real(
+                2 * static_cast<std::size_t>(post_split_niter(niter)))))
+          : nullptr;
 
   // auto_partitioner splits to one variable per chunk, so the body below runs
   // per variable, not per thread; scratch must live out here to be reused.
