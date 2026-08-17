@@ -482,7 +482,6 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   // auto_partitioner splits to one variable per chunk, so the body below runs
   // per variable, not per thread; scratch must live out here to be reused.
   struct Scratch {
-    Eigen::FFT<double> fft;
     std::vector<double> sorted, abs_dev, fft_re;
     std::vector<std::complex<double>> fft_freq;
     ZScratch zsc;
@@ -493,9 +492,12 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   tbb::parallel_for(
       tbb::blocked_range<int>(0, nvars),
       [&](const tbb::blocked_range<int>& range) {
+        // fft caches plans by nfft internally; thread_local keeps that cache
+        // alive across calls on this OS thread, not just within one call.
+        thread_local Eigen::FFT<double> fft;
         Scratch& sc = scratch.local();
         if (!sc.init) {
-          sc.fft.SetFlag(Eigen::FFT<double>::HalfSpectrum);
+          fft.SetFlag(Eigen::FFT<double>::HalfSpectrum);
           if (need_sorted) {
             sc.sorted.resize(n);
           }
@@ -504,7 +506,6 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           }
           sc.init = true;
         }
-        Eigen::FFT<double>& fft = sc.fft;
         std::vector<double>& sorted = sc.sorted;
         std::vector<double>& abs_dev = sc.abs_dev;
         std::vector<double>& fft_re = sc.fft_re;
