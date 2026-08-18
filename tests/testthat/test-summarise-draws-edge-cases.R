@@ -24,7 +24,7 @@ test_that("multiple variables with NA are each handled independently", {
 test_that("a constant (zero-variance) variable yields NA convergence diagnostics", {
   set.seed(3)
   arr <- array(rnorm(200 * 4 * 2), dim = c(200, 4, 2))
-  arr[, , 1] <- 7 # constant across all draws
+  arr[,, 1] <- 7 # constant across all draws
   x <- posterior::as_draws_array(arr)
 
   out <- posteriorcpp::summarise_draws_cpp(x)
@@ -75,8 +75,8 @@ test_that("a single draw total (niter = 1, nchains = 1) does not error", {
 test_that("large-magnitude and near-zero-variance draws do not break rank normalisation", {
   set.seed(12)
   arr <- array(rnorm(300 * 4 * 2, mean = 0, sd = 1), dim = c(300, 4, 2))
-  arr[, , 1] <- arr[, , 1] * 1e8 + 1e10       # very large magnitude
-  arr[, , 2] <- arr[, , 2] * 1e-8              # near-constant / tiny variance
+  arr[,, 1] <- arr[,, 1] * 1e8 + 1e10 # very large magnitude
+  arr[,, 2] <- arr[,, 2] * 1e-8 # near-constant / tiny variance
   x <- posterior::as_draws_array(arr)
   expect_matches_posterior(x)
 })

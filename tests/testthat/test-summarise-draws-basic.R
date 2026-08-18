@@ -20,7 +20,12 @@ test_that("column types are as expected", {
 
 test_that("accepts draws-coercible input types, not just draws_array", {
   set.seed(5)
-  m <- matrix(rnorm(400 * 3), nrow = 400, ncol = 3, dimnames = list(NULL, c("a", "b", "c")))
+  m <- matrix(
+    rnorm(400 * 3),
+    nrow = 400,
+    ncol = 3,
+    dimnames = list(NULL, c("a", "b", "c"))
+  )
   dm <- posterior::as_draws_matrix(m)
 
   expect_matches_posterior(dm)

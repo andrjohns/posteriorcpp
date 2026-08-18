@@ -68,11 +68,9 @@ static std::vector<double> average_ranks(const double* data, int S) {
   for (int i = 0; i < S; i++) {
     pbuf[i] = {data[i], i};
   }
-  std::sort(
-      pbuf.begin(), pbuf.end(),
-      [](const std::pair<double, int>& a, const std::pair<double, int>& b) {
-        return a.first < b.first;
-      });
+  std::sort(pbuf.begin(), pbuf.end(),
+            [](const std::pair<double, int>& a,
+               const std::pair<double, int>& b) { return a.first < b.first; });
   std::vector<double> rank(S);
   int i = 0;
   while (i < S) {
@@ -107,8 +105,8 @@ static std::shared_ptr<const std::vector<double>> qnorm_lut(int S) {
   const double denom = S - 2 * c + 1;
   auto lut = std::make_shared<std::vector<double>>(S);
   Eigen::Map<Eigen::VectorXd>(lut->data(), S) =
-      Eigen::VectorXd::LinSpaced(S, 1.0, static_cast<double>(S)).unaryExpr(
-          [&](double k) {
+      Eigen::VectorXd::LinSpaced(S, 1.0, static_cast<double>(S))
+          .unaryExpr([&](double k) {
             return R::qnorm((k - c) / denom, 0.0, 1.0, 1, 0);
           });
   std::lock_guard<std::mutex> lock(g_qnorm_lut_mutex);
@@ -129,10 +127,9 @@ static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
   Eigen::Map<Eigen::VectorXd>(z.data(), S) =
       (rank_v.array() == ir.cast<double>())
           .select(Eigen::Map<const Eigen::ArrayXd>(lut.data(), S)(ir - 1),
-                  ((rank_v.array() - c) / denom)
-                      .unaryExpr([&](double p) {
-                        return R::qnorm(p, 0.0, 1.0, 1, 0);
-                      }))
+                  ((rank_v.array() - c) / denom).unaryExpr([&](double p) {
+                    return R::qnorm(p, 0.0, 1.0, 1, 0);
+                  }))
           .matrix();
   return z;
 }
@@ -140,11 +137,11 @@ static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
 // Autocovariance of the centred series via the Wiener–Khinchin theorem:
 // the inverse transform of the power spectrum |r2c(x)|^2.
 static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
-                           const double xmean, Eigen::Ref<Eigen::VectorXd> out) {
+                           const double xmean,
+                           Eigen::Ref<Eigen::VectorXd> out) {
   const std::size_t N = static_cast<std::size_t>(x.size());
   // Zero-pad to L = 2N so the circular FFT correlation becomes linear.
-  const std::size_t L =
-      pocketfft::detail::util::good_size_real(2 * N);
+  const std::size_t L = pocketfft::detail::util::good_size_real(2 * N);
   std::vector<double> real(L, 0.0);
   Eigen::Map<Eigen::VectorXd>(real.data(), N) = x.array() - xmean;
   const double ss =
@@ -536,7 +533,8 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           double ess_sd_val = NA_REAL;
           if (need_ess_sd_val && !x_degenerate) {
             ess_sd_val = ess_basic(
-                split_chains((X.array() - mean_val).square().matrix()), nullptr);
+                split_chains((X.array() - mean_val).square().matrix()),
+                nullptr);
             if (want_ess_sd) {
               ess_sd_out[v] = ess_sd_val;
             }

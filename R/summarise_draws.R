@@ -1,13 +1,34 @@
 #' @keywords internal
 .posteriorcpp_all_stats <- c(
-  "mean", "median", "sd", "var", "mad", "q5", "q95",
-  "rhat", "rhat_basic", "ess_bulk", "ess_tail", "ess_basic",
-  "ess_mean", "ess_sd", "mcse_mean", "mcse_sd"
+  "mean",
+  "median",
+  "sd",
+  "var",
+  "mad",
+  "q5",
+  "q95",
+  "rhat",
+  "rhat_basic",
+  "ess_bulk",
+  "ess_tail",
+  "ess_basic",
+  "ess_mean",
+  "ess_sd",
+  "mcse_mean",
+  "mcse_sd"
 )
 
 #' @keywords internal
 .posteriorcpp_default_stats <- c(
-  "mean", "median", "sd", "mad", "q5", "q95", "rhat", "ess_bulk", "ess_tail"
+  "mean",
+  "median",
+  "sd",
+  "mad",
+  "q5",
+  "q95",
+  "rhat",
+  "ess_bulk",
+  "ess_tail"
 )
 
 #' Fast summaries of posterior draws
@@ -33,7 +54,8 @@ summarise_draws_cpp <- function(x, stats = .posteriorcpp_default_stats) {
   if (length(unknown) > 0L) {
     stop(sprintf(
       "Unknown `stats`: %s. Must be one or more of: %s.",
-      paste(unknown, collapse = ", "), paste(.posteriorcpp_all_stats, collapse = ", ")
+      paste(unknown, collapse = ", "),
+      paste(.posteriorcpp_all_stats, collapse = ", ")
     ))
   }
   stats <- .posteriorcpp_all_stats[.posteriorcpp_all_stats %in% stats]
