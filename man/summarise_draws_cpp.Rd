@@ -22,5 +22,5 @@ A \link[tibble:tibble]{tibble} with one row per variable and one
 column per requested statistic.
 }
 \description{
-A C++/RcppEigen implementation of \code{posterior::summarise_draws()}.
+A C++/Eigen implementation of \code{posterior::summarise_draws()}.
 }

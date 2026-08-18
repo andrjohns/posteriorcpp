@@ -1,6 +1,5 @@
-// [[Rcpp::depends(RcppEigen)]]
 // [[Rcpp::depends(RcppParallel)]]
-#include <RcppEigen.h>
+#include <Rcpp.h>
 #include <tbb/blocked_range.h>
 #include <tbb/parallel_for.h>
 
@@ -13,12 +12,20 @@
 #include <unordered_map>
 #include <vector>
 
-// autocovariance() uses pocketfft's r2c()/c2r(), whose plans are cached
-// internally (POCKETFFT_CACHE_SIZE entries). TBB parallelises over variables
-// here, so pocketfft's own worker pool is disabled (nthreads=1 below).
+// TBB parallelises over variables, so pocketfft's own pool stays off.
 #define POCKETFFT_CACHE_SIZE 16
 #define POCKETFFT_NO_MULTITHREADING
-#include "include/pocketfft_hdronly.h"
+#include <pocketfft_hdronly.h>
+
+// The vendored Eigen predates EIGEN_POCKETFFT_DEFAULT, so the backend header
+// is added on top and selected as a template argument instead.
+// clang-format off
+#include <Eigen/Core>
+#include <unsupported/Eigen/FFT>
+#include <unsupported/Eigen/src/FFT/pocketfft_impl.h>
+// clang-format on
+
+using PocketFFT = Eigen::FFT<double, Eigen::internal::pocketfft_impl<double>>;
 
 static constexpr double EPS = std::numeric_limits<double>::epsilon();
 
@@ -135,7 +142,7 @@ static Eigen::MatrixXd z_scale(const Eigen::Ref<const Eigen::MatrixXd>& x,
 }
 
 // Autocovariance of the centred series via the Wiener–Khinchin theorem:
-// the inverse transform of the power spectrum |r2c(x)|^2.
+// the inverse transform of the power spectrum |fwd(x)|^2.
 static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
                            const double xmean,
                            Eigen::Ref<Eigen::VectorXd> out) {
@@ -151,17 +158,14 @@ static void autocovariance(const Eigen::Ref<const Eigen::VectorXd>& x,
     return;
   }
   std::vector<std::complex<double>> spec(L / 2 + 1);
-  const pocketfft::shape_t shape{L};
-  const pocketfft::stride_t stride{sizeof(double)};
-  const pocketfft::stride_t cstride{sizeof(std::complex<double>)};
-  pocketfft::r2c<double>(shape, stride, cstride, 0, true, real.data(),
-                         spec.data(), 1.0);
-  const Eigen::Map<const Eigen::ArrayXcd> S(spec.data(),
-                                            static_cast<int>(spec.size()));
-  Eigen::Map<Eigen::ArrayXcd>(spec.data(), static_cast<int>(spec.size())) =
-      S.abs2();
-  pocketfft::c2r<double>(shape, cstride, stride, 0, false, spec.data(),
-                         real.data(), 1.0);
+  // Unscaled drops a 1/L pass the normalisation below makes redundant.
+  PocketFFT fft;
+  fft.SetFlag(PocketFFT::HalfSpectrum);
+  fft.SetFlag(PocketFFT::Unscaled);
+  fft.fwd(spec.data(), real.data(), static_cast<int>(L));
+  Eigen::Map<Eigen::ArrayXcd> S(spec.data(), static_cast<int>(spec.size()));
+  S = S.abs2();
+  fft.inv(real.data(), spec.data(), static_cast<int>(L));
   out.head(N) = Eigen::Map<const Eigen::VectorXd>(real.data(), N);
   // Normalise: varx * (N - 1) == ss, so the (N - 1) factors cancel exactly.
   out *= (ss / static_cast<double>(N)) / out[0];

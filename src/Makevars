@@ -1,4 +1,5 @@
 CXX_STD = CXX20
 
+PKG_CPPFLAGS += -Iinclude
 PKG_CXXFLAGS += $(shell "${R_HOME}/bin/Rscript" -e "RcppParallel::CxxFlags()")
 PKG_LIBS += $(shell "${R_HOME}/bin/Rscript" -e "RcppParallel::RcppParallelLibs()")

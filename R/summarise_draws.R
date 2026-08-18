@@ -33,7 +33,7 @@
 
 #' Fast summaries of posterior draws
 #'
-#' A C++/RcppEigen implementation of `posterior::summarise_draws()`.
+#' A C++/Eigen implementation of `posterior::summarise_draws()`.
 #'
 #' @param x A `draws` object, or an object coercible to one via
 #'   [posterior::as_draws()].

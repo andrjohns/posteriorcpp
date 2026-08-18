@@ -6,7 +6,7 @@
 \alias{posteriorcpp-package}
 \title{posteriorcpp: Fast C++ Implementations of Bayesian Summary Statistics}
 \description{
-Provides C++/RcppEigen implementations of summary and convergence diagnostics for posterior draws, matching the 'posterior' package but optimised for speed.
+Provides C++/Eigen implementations of summary and convergence diagnostics for posterior draws, matching the 'posterior' package but optimised for speed. Eigen and pocketfft are bundled, so no external headers are required beyond 'Rcpp' and 'RcppParallel'.
 }
 \author{
 \strong{Maintainer}: Andrew R. Johnson \email{andrew.johnson@arjohnsonau.com} (\href{https://orcid.org/0000-0001-7000-8065}{ORCID})
