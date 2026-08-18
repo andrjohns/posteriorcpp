@@ -42,12 +42,45 @@ static bool is_degenerate(const Eigen::Ref<const Eigen::MatrixXd>& x) {
   return !x.allFinite() || (x.maxCoeff() - x.minCoeff()) < EPS;
 }
 
+// Match R's corrected long-double mean. Besides improving summation accuracy,
+// this avoids intermediate overflow for large, same-sign finite draws.
+static double r_mean(const double* data, int n) {
+  long double mean = 0.0L;
+  for (int i = 0; i < n; ++i) {
+    mean += static_cast<long double>(data[i]);
+  }
+  mean /= static_cast<long double>(n);
+  if (std::isfinite(static_cast<double>(mean))) {
+    long double correction = 0.0L;
+    for (int i = 0; i < n; ++i) {
+      correction += static_cast<long double>(data[i]) - mean;
+    }
+    mean += correction / static_cast<long double>(n);
+  }
+  return static_cast<double>(mean);
+}
+
 static double quantile7(const std::vector<double>& sorted, double p) {
   const int n = sorted.size();
   const double h = (n - 1) * p;
   const int lo = static_cast<int>(std::floor(h));
   const int hi = static_cast<int>(std::ceil(h));
-  return sorted[lo] + (h - lo) * (sorted[hi] - sorted[lo]);
+  const double fraction = h - lo;
+  if (lo == hi || fraction == 0.0) {
+    return sorted[lo];
+  }
+  return (1.0 - fraction) * sorted[lo] + fraction * sorted[hi];
+}
+
+// R's median.default() uses mean() for the two middle values. Its corrected
+// long-double mean can differ by one ULP from type-7 interpolation; that ULP
+// matters when folded R-hat ranks the two central absolute deviations.
+static double r_median(const std::vector<double>& sorted) {
+  const int n = sorted.size();
+  if (n % 2 != 0) {
+    return sorted[n / 2];
+  }
+  return r_mean(sorted.data() + n / 2 - 1, 2);
 }
 
 template <typename Derived>
@@ -243,7 +276,12 @@ static double ess_basic(const Eigen::Ref<const Eigen::MatrixXd>& x,
       rho[t + 1] = rho[t];
     }
   }
-  double sum_rho = Eigen::Map<const Eigen::VectorXd>(rho.data(), max_t).sum();
+  // In the reference implementation, rho_hat_t[1:0] selects the first
+  // element (R ignores the zero index). Preserve that boundary behaviour for
+  // split chains of length 3--5, where max_t remains zero.
+  const int sum_count = std::max(max_t, 1);
+  double sum_rho =
+      Eigen::Map<const Eigen::VectorXd>(rho.data(), sum_count).sum();
   double tau_hat = -1.0 + 2.0 * sum_rho + rho[max_t];
   const double ess = static_cast<double>(nchains) * niter;
   const double tau_bound = 1.0 / std::log10(ess);
@@ -300,8 +338,9 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
   const bool need_var_val =
       want_sd || want_var || want_mcse_mean || want_mcse_sd;
   const bool need_ess_sd_val = want_ess_sd || want_mcse_sd;
-  // Degeneracy survives split/z_scale/abs/indicator, so one range check on X
-  // serves every rhat/ess path.
+  // Raw and quantile diagnostics use the original-scale degeneracy check.
+  // Rank-normalized diagnostics must check after transformation because
+  // distinct values less than EPS apart become well-separated ranks.
   const bool need_x_degenerate = want_ess_tail || want_rhat_basic ||
                                  want_rhat || want_ess_bulk || need_raw_ess ||
                                  need_ess_sd_val;
@@ -394,7 +433,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
             x_degenerate = (X.maxCoeff() - X.minCoeff()) < EPS;
           }
 
-          const double mean_val = X.mean();
+          const double mean_val = r_mean(X.data(), n);
           if (want_mean) {
             mean_out[v] = mean_val;
           }
@@ -403,7 +442,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           double ss = NA_REAL;  // sum of squared centred draws
           if (need_var_val) {
             ss = (X.array() - mean_val).matrix().squaredNorm();
-            var_val = ss / (n - 1);
+            var_val = n > 1 ? ss / (n - 1) : NA_REAL;
             if (want_sd || want_var || want_mcse_mean) {
               sd_val = std::sqrt(var_val);
             }
@@ -419,7 +458,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           if (need_sorted) {
             std::copy(X.data(), X.data() + n, sorted.begin());
             std::sort(sorted.begin(), sorted.end());
-            median_val = quantile7(sorted, 0.5);
+            median_val = r_median(sorted);
             q5_val = quantile7(sorted, 0.05);
             q95_val = quantile7(sorted, 0.95);
             if (want_median) {
@@ -447,16 +486,16 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
                                        sorted.data() + n_left, n - n_left) -
                                    median_val;
             std::inplace_merge(dev.begin(), dev.begin() + n_left, dev.end());
-            mad_out[v] = 1.4826 * quantile7(abs_dev, 0.5);
+            mad_out[v] = 1.4826 * r_median(abs_dev);
           }
 
           double rhat_bulk = NA_REAL;
           double ess_raw_val = NA_REAL;
           // Degenerate variables are NA for every rhat/ess stat, and the
           // outputs are pre-filled with NA.
-          if (!x_degenerate && (need_raw_bulk_pass || need_norm_bulk_pass)) {
+          if (need_raw_bulk_pass || need_norm_bulk_pass) {
             const Eigen::MatrixXd Xs = split_chains(X);
-            if (need_raw_bulk_pass) {
+            if (need_raw_bulk_pass && !x_degenerate) {
               double rhat_basic_val = NA_REAL;
               if (want_rhat_basic && need_raw_ess) {
                 // Paired: one degeneracy check and one chain-means pass
@@ -511,7 +550,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           }
 
           double rhat_tail = NA_REAL;
-          if (want_rhat && !x_degenerate) {
+          if (want_rhat) {
             const Eigen::MatrixXd Xfsz =
                 z_scale(split_chains((X.array() - median_val).abs().matrix()),
                         *shared_qnorm_lut);
@@ -522,7 +561,7 @@ Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws,
           if (want_ess_tail) {
             double ess_q5 = NA_REAL;
             double ess_q95 = NA_REAL;
-            if (!x_degenerate) {
+            if (!x_degenerate && X.allFinite()) {
               ess_q5 = ess_basic(
                   split_chains((X.array() <= q5_val).cast<double>().matrix()),
                   nullptr);
