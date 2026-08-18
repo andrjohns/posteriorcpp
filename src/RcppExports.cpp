@@ -10,6 +10,20 @@ Rcpp::Rostream<true>&  Rcpp::Rcout = Rcpp::Rcpp_cout_get();
 Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
+// loo_cpp_
+Rcpp::List loo_cpp_(Rcpp::NumericVector log_lik, Rcpp::NumericVector r_eff, bool auto_r_eff, bool save_psis);
+RcppExport SEXP _posteriorcpp_loo_cpp_(SEXP log_likSEXP, SEXP r_effSEXP, SEXP auto_r_effSEXP, SEXP save_psisSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type log_lik(log_likSEXP);
+    Rcpp::traits::input_parameter< Rcpp::NumericVector >::type r_eff(r_effSEXP);
+    Rcpp::traits::input_parameter< bool >::type auto_r_eff(auto_r_effSEXP);
+    Rcpp::traits::input_parameter< bool >::type save_psis(save_psisSEXP);
+    rcpp_result_gen = Rcpp::wrap(loo_cpp_(log_lik, r_eff, auto_r_eff, save_psis));
+    return rcpp_result_gen;
+END_RCPP
+}
 // summarise_draws_cpp_
 Rcpp::List summarise_draws_cpp_(Rcpp::NumericVector draws, Rcpp::CharacterVector stats);
 RcppExport SEXP _posteriorcpp_summarise_draws_cpp_(SEXP drawsSEXP, SEXP statsSEXP) {
@@ -24,6 +38,7 @@ END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
+    {"_posteriorcpp_loo_cpp_", (DL_FUNC) &_posteriorcpp_loo_cpp_, 4},
     {"_posteriorcpp_summarise_draws_cpp_", (DL_FUNC) &_posteriorcpp_summarise_draws_cpp_, 2},
     {NULL, NULL, 0}
 };
